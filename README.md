@@ -92,6 +92,13 @@ python run.py validate-config --config config.yaml
 python run.py offline-self-test --config config.yaml
 ```
 
+The dependency set supports NumPy 2 (`>=2.0,<3.0`) and deliberately preserves
+an already compatible NumPy 2 release in Colab. The notebooks do not downgrade
+NumPy or force a restart merely because NumPy 2 is already loaded. They run
+`pip check` and a fresh-process import check before any CARLA workflow begins.
+The other pins and narrow compatibility ranges cover Google's published Python
+3.12 Colab runtimes without replacing their CUDA-enabled PyTorch installation.
+
 The default **external** mode connects to an already running CARLA server at
 `127.0.0.1:2000`. Override connection settings with `CARLA_HOST`,
 `CARLA_PORT`, and `CARLA_TM_PORT`. The optional **managed** mode launches only
