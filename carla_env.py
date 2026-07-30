@@ -143,6 +143,7 @@ class HighwayDecisionEnv(gym.Env):
             maxlen=config["environment"]["action_repeat_ticks"] + 2
         )
         self.last_rgb_frame = None
+        self.last_render_frame_id = None
         self.render_frames.clear()
         self.episode_token = 0
         self.closed = False
@@ -1333,6 +1334,7 @@ class HighwayDecisionEnv(gym.Env):
         array = np.frombuffer(selected.raw_data, dtype=np.uint8)
         array = array.reshape((selected.height, selected.width, 4))
         self.last_rgb_frame = array[:, :, :3][:, :, ::-1].copy()
+        self.last_render_frame_id = int(selected.frame)
         self.render_frames.append(self.last_rgb_frame)
 
     def _update_metrics_tick(self, state):

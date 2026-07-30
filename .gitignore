@@ -18,3 +18,11 @@ reports/generated/*
 *.toc
 *.synctex.gz
 reports/*.pdf
+
+# Ephemeral packaged-CARLA runtime state (never experiment artifacts)
+CARLA_0.9.16/
+CARLA_0.9.16.extracting/
+CARLA_0.9.16.tar.gz
+CARLA_0.9.16.tar.gz.*
+carla_cache/
+artifacts/logs/runtime/carla_server.json

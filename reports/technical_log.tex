@@ -17,11 +17,35 @@
 % Correct an old entry with a new dated note rather than deleting history.
 
 \section{Runtime and CARLA Installation Notes}
-The implementation targets Python 3.12 and the packaged CARLA 0.9.16 UE4.26
-release. The CARLA Python client and simulator server are separate processes.
-External mode is the default; managed mode requires an explicit CARLA root and
-records the repository-owned process group before it can be stopped. The
-implementation task did not install or run a CARLA server.
+The execution target is a hosted Google Colab GPU VM using Python 3.10--3.12
+and packaged CARLA 0.9.16. The default managed server and Python client run in
+the same VM and communicate over localhost; external mode remains supported.
+The implementation task did not download the multi-gigabyte archive or run a
+CARLA server.
+
+\section{Hosted Runtime Provisioning Decisions}
+The compressed package is a persistent asset distinct from experiment
+artifacts. A first successful download is structurally validated and hashed
+before the archive and metadata are cached in Google Drive. A fresh ephemeral
+VM restores the archive to local storage, verifies it against metadata, and
+extracts it atomically below \texttt{/content}. CARLA is never executed from
+Drive. The wheel under \texttt{PythonAPI/carla/dist} is selected by CARLA
+version, current CPython tag, and Linux x86\_64 platform, then force-installed
+without dependencies.
+
+Managed launch requires a visible NVIDIA GPU and a working NVIDIA Vulkan
+device; software-only Vulkan implementations are rejected. Both training and video
+servers are off-screen. Training additionally uses CARLA's
+\texttt{world.no\_rendering\_mode=true}, whereas RGB video uses
+\texttt{no\_rendering\_mode=false}. These settings are distinct from window or
+remote-desktop infrastructure, neither of which is used.
+
+PPO execution is divided into 5,000-decision restartable chunks and paired
+evaluation into approximately 15-condition slices. Artifacts are synchronized
+after every chunk or slice. Each successful video is also synchronized
+immediately. Live PID records include hostname and Linux boot ID, are excluded
+from durable artifact sync, and are treated as stale rather than actionable
+when restored into another ephemeral VM.
 
 \section{Repository Architecture}
 The exact three Python source files are \texttt{carla\_env.py},
@@ -76,8 +100,14 @@ implementation. Offline synthetic checks cover action validity and the blocked
 lane branch of the rule-based policy.
 
 \section{Bugs and Resolutions}
-No experimental bugs are recorded. Implementation-time validation findings
-should be appended here with a date once offline and CARLA-backed checks run.
+No experimental bugs are recorded. A setup-only incompatibility was found in
+the earlier notebook: it treated an already loaded NumPy version as grounds for
+a downgrade and runtime restart, while a global \texttt{pip check} could report
+unrelated packages preinstalled by Colab. The resolution keeps
+\texttt{numpy>=2.0,<3.0}, installs ordinary requirements before project
+imports, validates them in a fresh Python process, and installs the
+package-shipped CARLA wheel only after extraction. No server-backed outcome is
+inferred from this fix.
 
 \section{Evaluation Manifest Versions}
 No manifest has been frozen yet. Each future manifest record must include its

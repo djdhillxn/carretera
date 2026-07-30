@@ -17,12 +17,27 @@ carla:
   fixed_delta_seconds: 0.05
   synchronous_mode: true
 
+  package:
+    download_url: https://tiny.carla.org/carla-0-9-16-linux
+    archive_name: CARLA_0.9.16.tar.gz
+    drive_cache_subdirectory: runtime
+    metadata_name: CARLA_0.9.16.metadata.json
+    drive_archive: ""
+    drive_metadata: ""
+    local_archive: /content/CARLA_0.9.16.tar.gz
+    local_root: /content/CARLA_0.9.16
+    extraction_staging_root: /content/CARLA_0.9.16.extracting
+    local_cache_root: /content/carla_cache
+    minimum_free_disk_gb: 35
+    delete_local_archive_after_extract: true
+    require_drive_cache: false
+
   server:
-    mode: external
-    root: ""
-    quality_training: Low
+    mode: managed
+    root: /content/CARLA_0.9.16
+    quality_training: Epic
     quality_rendering: Epic
-    startup_timeout_seconds: 90
+    startup_timeout_seconds: 180
     training_offscreen: true
     rendering_offscreen: true
     training_no_rendering_mode: true

@@ -8,19 +8,22 @@ import datetime
 import hashlib
 import importlib
 import importlib.metadata
+import io
 import json
 import math
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import warnings
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 import yaml
@@ -56,14 +59,20 @@ REQUIRED_TOP_LEVEL_KEYS = [
     "rule_based",
 ]
 ENVIRONMENT_OVERRIDES = {
+    "CARLA_ARCHIVE_URL": ("carla", "package", "download_url", str),
+    "CARLA_ARCHIVE_DRIVE": ("carla", "package", "drive_archive", str),
+    "CARLA_ARCHIVE_LOCAL": ("carla", "package", "local_archive", str),
+    "CARLA_ARCHIVE_METADATA": ("carla", "package", "drive_metadata", str),
     "CARLA_HOST": ("carla", "host", str),
     "CARLA_PORT": ("carla", "port", int),
     "CARLA_TM_PORT": ("carla", "traffic_manager_port", int),
-    "CARLA_ROOT": ("carla", "server", "root", str),
+    "CARLA_ROOT": ("carla", "package", "local_root", str),
+    "CARLA_CACHE_DIR": ("carla", "package", "local_cache_root", str),
     "CARLA_SERVER_MODE": ("carla", "server", "mode", str),
     "HIGHWAY_RL_ARTIFACT_ROOT": ("paths", "artifact_root", str),
     "HIGHWAY_RL_DRIVE_ROOT": ("paths", "drive_root", str),
 }
+NETWORK_ACQUISITION_CALLS = 0
 
 
 def utc_now():
@@ -102,6 +111,35 @@ def load_config(path):
     config["paths"]["drive_root"] = str(
         resolve_path(config["paths"]["drive_root"])
     )
+    package = config["carla"]["package"]
+    for key in (
+        "local_archive",
+        "local_root",
+        "extraction_staging_root",
+        "local_cache_root",
+    ):
+        package[key] = str(resolve_path(package[key]))
+    if os.environ.get("CARLA_ROOT"):
+        config["carla"]["server"]["root"] = package["local_root"]
+    if package.get("drive_archive"):
+        package["drive_archive"] = str(resolve_path(package["drive_archive"]))
+    else:
+        package["drive_archive"] = str(
+            resolve_path(
+                Path(config["paths"]["drive_root"])
+                / package["drive_cache_subdirectory"]
+                / package["archive_name"]
+            )
+        )
+    if package.get("drive_metadata"):
+        package["drive_metadata"] = str(resolve_path(package["drive_metadata"]))
+    else:
+        package["drive_metadata"] = str(
+            Path(package["drive_archive"]).with_name(package["metadata_name"])
+        )
+    config["carla"]["server"]["root"] = str(
+        resolve_path(config["carla"]["server"]["root"])
+    )
     validate_config_data(config)
     return config
 
@@ -112,6 +150,8 @@ def validate_config_data(config):
         raise ValueError("Missing required config sections: %s" % ", ".join(missing))
     if str(config["carla"]["version"]) != "0.9.16":
         raise ValueError("The project scope requires CARLA 0.9.16.")
+    if "package" not in config["carla"]:
+        raise ValueError("Missing carla.package configuration.")
     if config["carla"]["map"] != "Town04":
         raise ValueError("The project scope requires Town04.")
     if config["environment"]["action_repeat_ticks"] != 20:
@@ -256,6 +296,1211 @@ def machine_metadata():
     }
 
 
+def linux_boot_id():
+    path = Path("/proc/sys/kernel/random/boot_id")
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unavailable"
+
+
+def os_release_information():
+    path = Path("/etc/os-release")
+    values = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key] = value.strip().strip('"')
+    except OSError as exc:
+        values["error"] = str(exc)
+    return values
+
+
+def pip_version():
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return "unavailable: %s" % exc
+
+
+def directory_size(path):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            if item.is_file() and not item.is_symlink():
+                total += item.stat().st_size
+    except OSError:
+        return None
+    return total
+
+
+def nearest_existing_parent(path):
+    current = Path(path)
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return current
+
+
+def disk_free_gb(path):
+    parent = nearest_existing_parent(path)
+    return round(shutil.disk_usage(parent).free / (1024 ** 3), 2)
+
+
+def gpu_status():
+    status = {
+        "nvidia_smi_available": shutil.which("nvidia-smi") is not None,
+        "devices": [],
+        "gpu_name": "",
+        "vram": "",
+        "driver_version": "",
+        "pytorch_cuda_available": False,
+        "pytorch_visible_devices": 0,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    }
+    if status["nvidia_smi_available"]:
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total,driver_version",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            for line in result.stdout.splitlines():
+                fields = [field.strip() for field in line.split(",")]
+                if len(fields) >= 3:
+                    status["devices"].append(
+                        {
+                            "name": fields[0],
+                            "memory_total_mib": fields[1],
+                            "driver_version": fields[2],
+                        }
+                    )
+            if status["devices"]:
+                first = status["devices"][0]
+                status["gpu_name"] = first["name"]
+                status["vram"] = "%s MiB" % first["memory_total_mib"]
+                status["driver_version"] = first["driver_version"]
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            status["nvidia_smi_error"] = str(exc)
+    try:
+        import torch
+
+        status["pytorch_cuda_available"] = bool(torch.cuda.is_available())
+        status["pytorch_visible_devices"] = int(torch.cuda.device_count())
+    except (ImportError, RuntimeError) as exc:
+        status["pytorch_error"] = str(exc)
+    status["compatible"] = bool(
+        status["devices"] and status["pytorch_cuda_available"]
+    )
+    return status
+
+
+def vulkan_status():
+    executable = shutil.which("vulkaninfo")
+    status = {
+        "vulkaninfo_available": executable is not None,
+        "exit_code": None,
+        "physical_devices": [],
+        "device_names": [],
+        "nvidia_device_present": False,
+        "software_renderer_present": False,
+        "stderr": "",
+        "compatible": False,
+    }
+    if not executable:
+        return status
+    try:
+        result = subprocess.run(
+            [executable, "--summary"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        status["exit_code"] = result.returncode
+        combined = result.stdout + "\n" + result.stderr
+        for line in combined.splitlines():
+            stripped = line.strip()
+            if re.search(r"deviceName\s*=", stripped, flags=re.IGNORECASE):
+                name = stripped.split("=", 1)[1].strip()
+                if name and name not in status["device_names"]:
+                    status["device_names"].append(name)
+            if re.match(r"GPU\d+:", stripped):
+                name = stripped.split(":", 1)[1].strip()
+                if name and name not in status["device_names"]:
+                    status["device_names"].append(name)
+        status["physical_devices"] = [
+            {"name": name} for name in status["device_names"]
+        ]
+        lowered = combined.lower()
+        software_names = ("llvmpipe", "lavapipe", "software rasterizer", "swiftshader")
+        status["software_renderer_present"] = any(
+            name in lowered for name in software_names
+        )
+        status["nvidia_device_present"] = any(
+            "nvidia" in name.lower() for name in status["device_names"]
+        )
+        status["stderr"] = result.stderr[-4000:]
+        status["compatible"] = bool(
+            result.returncode == 0
+            and status["nvidia_device_present"]
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        status["stderr"] = str(exc)
+    return status
+
+
+def gpu_vulkan_error(gpu, vulkan):
+    if not gpu["devices"]:
+        return (
+            "No NVIDIA GPU is assigned. In Colab, select Runtime \u2192 Change "
+            "runtime type \u2192 GPU, reconnect, and rerun initialization."
+        )
+    if not vulkan["vulkaninfo_available"]:
+        return (
+            "NVIDIA is visible, but vulkaninfo is unavailable. Run the notebook "
+            "system-dependencies cell, then rerun runtime status."
+        )
+    if not vulkan["compatible"]:
+        return (
+            "NVIDIA is visible but no working NVIDIA Vulkan device was detected. "
+            "A software Vulkan renderer is not supported; reconnect to a new GPU "
+            "runtime and rerun the runtime status cell."
+        )
+    return ""
+
+
+def python_tag(version_info=None):
+    info = version_info or sys.version_info
+    return "cp%s%s" % (info.major, info.minor)
+
+
+def discover_wheels(root):
+    root = Path(root)
+    distribution = root / "PythonAPI/carla/dist"
+    if not distribution.is_dir():
+        return []
+    return sorted(distribution.glob("*.whl"))
+
+
+def select_carla_wheel(candidates, tag=None, version="0.9.16"):
+    tag = tag or python_tag()
+    names = [Path(candidate).name for candidate in candidates]
+    matches = []
+    for candidate in candidates:
+        name = Path(candidate).name
+        lowered = name.lower()
+        version_match = (
+            ("carla-%s" % version).lower() in lowered
+            or ("carla_%s" % version).lower() in lowered
+        )
+        interpreter_match = re.search(
+            r"-%s(?:-%s)?-" % (re.escape(tag), re.escape(tag)), lowered
+        )
+        linux_match = (
+            "linux" in lowered
+            and ("x86_64" in lowered or "amd64" in lowered)
+        )
+        if version_match and interpreter_match and linux_match:
+            matches.append(Path(candidate))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Expected exactly one CARLA %s Linux x86_64 wheel for %s; found %s. "
+            "Discovered wheels: %s"
+            % (version, tag, len(matches), ", ".join(names) or "(none)")
+        )
+    return matches[0]
+
+
+def archive_member_is_safe(member):
+    name = member.name.replace("\\", "/")
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts:
+        return False
+    if member.issym() or member.islnk():
+        link = PurePosixPath(member.linkname.replace("\\", "/"))
+        if link.is_absolute() or ".." in link.parts:
+            return False
+    return True
+
+
+def archive_root_from_names(names):
+    normalized = [PurePosixPath(name.replace("\\", "/")) for name in names]
+    roots = set()
+    for path in normalized:
+        if path.name != "CarlaUE4.sh":
+            continue
+        root = path.parent
+        prefix = "" if str(root) == "." else str(root).rstrip("/") + "/"
+        if any(
+            str(item).startswith(prefix + "PythonAPI/carla/dist/")
+            for item in normalized
+        ):
+            roots.add(str(root))
+    if len(roots) != 1:
+        raise RuntimeError(
+            "Archive must contain exactly one packaged CARLA root; found %s."
+            % len(roots)
+        )
+    return next(iter(roots))
+
+
+def validate_carla_archive(path, version="0.9.16", allow_small=False):
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError("CARLA archive is missing or empty: %s" % path)
+    with path.open("rb") as handle:
+        header = handle.read(512).lower()
+    if b"<html" in header or b"<!doctype html" in header:
+        raise RuntimeError("Downloaded file is HTML, not a CARLA archive: %s" % path)
+    minimum_bytes = 100 * 1024 * 1024
+    if not allow_small and path.stat().st_size < minimum_bytes:
+        raise RuntimeError(
+            "CARLA archive is implausibly small (%s bytes): %s"
+            % (path.stat().st_size, path)
+        )
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            members = archive.getmembers()
+    except (OSError, tarfile.TarError) as exc:
+        raise RuntimeError("CARLA archive is not a readable gzip tar: %s" % exc) from exc
+    unsafe = [member.name for member in members if not archive_member_is_safe(member)]
+    if unsafe:
+        raise RuntimeError(
+            "CARLA archive contains unsafe member paths: %s"
+            % ", ".join(unsafe[:5])
+        )
+    names = [member.name for member in members]
+    normalized_names = [
+        str(PurePosixPath(name.replace("\\", "/"))) for name in names
+    ]
+    archive_root = archive_root_from_names(normalized_names)
+    root_prefix = "" if archive_root == "." else archive_root.rstrip("/") + "/"
+    shipping_binary = (
+        root_prefix
+        + "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
+    )
+    if not any(name.rstrip("/") == shipping_binary for name in normalized_names):
+        raise RuntimeError(
+            "Archive is missing the packaged Linux CarlaUE4 support binary."
+        )
+    wheels = [
+        name
+        for name in normalized_names
+        if name.lower().endswith(".whl")
+        and "pythonapi/carla/dist/" in name.lower()
+        and version in name
+        and ("linux" in name.lower())
+        and ("x86_64" in name.lower() or "amd64" in name.lower())
+    ]
+    if not wheels:
+        raise RuntimeError("Archive contains no CARLA %s Linux wheel." % version)
+    if not any("town04" in name.lower() for name in normalized_names):
+        raise RuntimeError("Archive contains no inspectable Town04 package content.")
+    return {
+        "valid": True,
+        "archive": str(path),
+        "byte_size": path.stat().st_size,
+        "sha256": file_sha256(path),
+        "member_count": len(names),
+        "archive_root": archive_root,
+        "wheels": [Path(name).name for name in wheels],
+        "town04_present": True,
+        "validated_at": utc_now(),
+    }
+
+
+def discover_carla_root(extraction_root):
+    candidates = []
+    for executable in Path(extraction_root).rglob("CarlaUE4.sh"):
+        root = executable.parent
+        if (root / "PythonAPI/carla/dist").is_dir():
+            candidates.append(root)
+    unique = sorted(set(path.resolve() for path in candidates))
+    if len(unique) != 1:
+        raise RuntimeError(
+            "Expected one extracted CARLA package root; found %s: %s"
+            % (len(unique), ", ".join(str(path) for path in unique) or "(none)")
+        )
+    return unique[0]
+
+
+def safe_extract_archive(archive_path, staging_root):
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        unsafe = [member.name for member in members if not archive_member_is_safe(member)]
+        if unsafe:
+            raise RuntimeError(
+                "Refusing to extract unsafe archive members: %s"
+                % ", ".join(unsafe[:5])
+            )
+        archive.extractall(staging_root)
+
+
+def managed_local_paths(config):
+    package = config["carla"]["package"]
+    local_archive = Path(package["local_archive"]).resolve()
+    return {
+        local_archive,
+        local_archive.with_name(local_archive.name + ".part"),
+        local_archive.with_name(local_archive.name + ".from-drive.part"),
+        Path(package["local_root"]).resolve(),
+        Path(package["extraction_staging_root"]).resolve(),
+        Path(package["local_cache_root"]).resolve(),
+    }
+
+
+def safe_managed_path(config, path):
+    path = Path(path).resolve()
+    forbidden = {
+        Path("/").resolve(),
+        Path("/content").resolve(),
+        REPOSITORY_ROOT.resolve(),
+        Path(config["paths"]["drive_root"]).resolve(),
+    }
+    if path in forbidden or path not in managed_local_paths(config):
+        return False
+    package = config["carla"]["package"]
+    version_token = str(config["carla"]["version"])
+    return bool(
+        version_token in path.name
+        or path == Path(package["local_cache_root"]).resolve()
+    )
+
+
+def remove_managed_path(config, path, dry_run=False):
+    path = Path(path).resolve()
+    if not safe_managed_path(config, path):
+        raise ValueError("Refusing to remove unrecognized managed path: %s" % path)
+    if dry_run or not path.exists():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def read_json_if_valid(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def package_manifest_path(config):
+    return Path(config["carla"]["package"]["local_root"]) / (
+        ".carretera_runtime_manifest.json"
+    )
+
+
+def runtime_manifest_matches(config, archive_sha256=None):
+    package = config["carla"]["package"]
+    root = Path(package["local_root"])
+    manifest = read_json_if_valid(package_manifest_path(config))
+    if not manifest:
+        return False
+    matches = bool(
+        manifest.get("carla_version") == str(config["carla"]["version"])
+        and Path(manifest.get("package_root", "")).resolve() == root.resolve()
+        and (root / "CarlaUE4.sh").is_file()
+        and (root / "PythonAPI/carla/dist").is_dir()
+    )
+    if archive_sha256 is not None:
+        matches = matches and manifest.get("archive_sha256") == archive_sha256
+    return matches
+
+
+def server_record_state(config, record=None):
+    record = record if record is not None else read_server_record(config)
+    if not record:
+        return {"state": "absent", "active": False, "stale": False}
+    hostname_match = record.get("hostname") == socket.gethostname()
+    boot_match = record.get("boot_id") == linux_boot_id()
+    if not hostname_match or not boot_match:
+        return {
+            "state": "stale_runtime_identity",
+            "active": False,
+            "stale": True,
+            "hostname_match": hostname_match,
+            "boot_id_match": boot_match,
+        }
+    active = server_record_matches_process(record)
+    return {
+        "state": "active" if active else "inactive_or_identity_mismatch",
+        "active": active,
+        "stale": False,
+        "hostname_match": True,
+        "boot_id_match": True,
+    }
+
+
+def python_client_status():
+    status = {"distribution_version": "not installed", "import_success": False}
+    try:
+        status["distribution_version"] = importlib.metadata.version("carla")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    try:
+        import carla
+
+        status["import_success"] = True
+        status["module"] = str(getattr(carla, "__file__", "unknown"))
+    except Exception as exc:
+        status["import_error"] = str(exc)
+    return status
+
+
+def build_runtime_status(config, verify_archive_hash=False, check_server=False):
+    package = config["carla"]["package"]
+    local_archive = Path(package["local_archive"])
+    drive_archive = Path(package["drive_archive"])
+    metadata_path = Path(package["drive_metadata"])
+    local_root = Path(package["local_root"])
+    executable = local_root / "CarlaUE4.sh"
+    local_metadata_path = (
+        Path(config["paths"]["artifact_root"])
+        / "logs/runtime/CARLA_0.9.16.local.metadata.json"
+    )
+    drive_metadata = read_json_if_valid(metadata_path)
+    local_metadata = read_json_if_valid(local_metadata_path)
+    metadata = drive_metadata or local_metadata
+    drive_cache_valid, drive_cache_reason = validate_drive_metadata(
+        drive_metadata, drive_archive, config["carla"]["version"]
+    )
+    package_manifest = read_json_if_valid(package_manifest_path(config))
+    wheels = discover_wheels(local_root)
+    matching_wheel = ""
+    wheel_error = ""
+    try:
+        matching_wheel = str(select_carla_wheel(wheels))
+    except RuntimeError as exc:
+        wheel_error = str(exc)
+    local_hash_matches = None
+    local_hash = ""
+    if local_archive.is_file() and metadata:
+        if verify_archive_hash:
+            local_hash = file_sha256(local_archive)
+            local_hash_matches = local_hash == metadata.get("sha256")
+        elif (
+            local_metadata
+            and local_metadata.get("local_sha256")
+            and local_archive.stat().st_size
+            == int(local_metadata.get("byte_size", -1))
+            and local_archive.stat().st_mtime_ns
+            == int(local_metadata.get("local_mtime_ns", -1))
+        ):
+            local_hash = local_metadata["local_sha256"]
+            local_hash_matches = local_hash == metadata.get("sha256")
+    gpu = gpu_status()
+    vulkan = vulkan_status()
+    drive_mounted = Path("/content/drive/MyDrive").is_dir()
+    record = read_server_record(config)
+    status = {
+        "runtime": {
+            "timestamp_utc": utc_now(),
+            "hostname": socket.gethostname(),
+            "boot_id": linux_boot_id(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "os_release": os_release_information(),
+            "python": sys.version,
+            "pip": pip_version(),
+            "appears_to_be_colab": bool(
+                os.environ.get("COLAB_RELEASE_TAG")
+                or os.environ.get("COLAB_GPU")
+                or Path("/content").exists()
+                and Path("/usr/local/lib/python3.").parent.exists()
+            ),
+            "content_exists": Path("/content").exists(),
+            "google_drive_mounted": drive_mounted,
+        },
+        "gpu": gpu,
+        "vulkan": vulkan,
+        "storage": {
+            "local_disk_probe": str(
+                Path("/content") if Path("/content").exists() else nearest_existing_parent(local_archive)
+            ),
+            "local_free_gb": disk_free_gb(
+                Path("/content") if Path("/content").exists() else local_archive
+            ),
+            "minimum_free_disk_gb": package["minimum_free_disk_gb"],
+            "drive_free_gb": (
+                disk_free_gb(config["paths"]["drive_root"])
+                if Path(config["paths"]["drive_root"]).exists()
+                else None
+            ),
+            "local_archive": str(local_archive),
+            "local_archive_exists": local_archive.is_file(),
+            "local_archive_size": (
+                local_archive.stat().st_size if local_archive.is_file() else 0
+            ),
+            "drive_archive": str(drive_archive),
+            "drive_archive_exists": drive_archive.is_file(),
+            "drive_archive_size": (
+                drive_archive.stat().st_size if drive_archive.is_file() else 0
+            ),
+            "drive_cache_valid": drive_cache_valid,
+            "drive_cache_error": drive_cache_reason,
+            "local_root": str(local_root),
+            "local_root_exists": local_root.is_dir(),
+            "local_root_size": directory_size(local_root),
+            "executable_exists": executable.is_file(),
+        },
+        "archive": {
+            "metadata_path": str(metadata_path),
+            "metadata_exists": metadata is not None,
+            "drive_metadata_exists": drive_metadata is not None,
+            "local_metadata_path": str(local_metadata_path),
+            "local_metadata_exists": local_metadata is not None,
+            "metadata_sha256": metadata.get("sha256", "") if metadata else "",
+            "local_sha256": local_hash,
+            "local_hash_matches_metadata": local_hash_matches,
+        },
+        "package_manifest": {
+            "path": str(package_manifest_path(config)),
+            "exists": package_manifest is not None,
+            "matches_runtime": runtime_manifest_matches(config),
+            "contents": package_manifest,
+        },
+        "python_client": {
+            **python_client_status(),
+            "python_tag": python_tag(),
+            "discovered_wheels": [path.name for path in wheels],
+            "matching_wheel": matching_wheel,
+            "wheel_error": wheel_error,
+        },
+        "managed_server": {
+            "mode": config["carla"]["server"]["mode"],
+            "configured_root": config["carla"]["server"]["root"],
+            "executable_exists": executable.is_file(),
+            "executable_is_executable": bool(
+                executable.is_file() and os.access(executable, os.X_OK)
+            ),
+            "record": record,
+            "record_state": server_record_state(config, record),
+            "reachable": None,
+        },
+    }
+    if check_server:
+        try:
+            with socket.create_connection(
+                (config["carla"]["host"], config["carla"]["port"]), timeout=2.0
+            ):
+                status["managed_server"]["reachable"] = True
+        except OSError as exc:
+            status["managed_server"]["reachable"] = False
+            status["managed_server"]["reachability_error"] = str(exc)
+    status["compatibility"] = {
+        "linux": platform.system() == "Linux",
+        "x86_64": platform.machine().lower() in ("x86_64", "amd64"),
+        "supported_python": (
+            sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12
+        ),
+        "local_disk_sufficient": (
+            status["storage"]["local_free_gb"]
+            >= float(package["minimum_free_disk_gb"])
+        ),
+        "gpu_vulkan_error": gpu_vulkan_error(gpu, vulkan),
+    }
+    return status
+
+
+def save_runtime_status(config, status):
+    root = ensure_artifact_layout(config)
+    path = root / "logs/runtime/runtime_status.json"
+    write_json(path, status)
+    return path
+
+
+def command_runtime_status(args):
+    config = load_config(args.config)
+    status = build_runtime_status(
+        config,
+        verify_archive_hash=args.verify_archive_hash,
+        check_server=args.check_server,
+    )
+    path = save_runtime_status(config, status)
+    print(json.dumps(status, indent=2))
+    print("Saved runtime status:", path)
+    if args.strict:
+        compatibility = status["compatibility"]
+        failures = [
+            key
+            for key in ("linux", "x86_64", "supported_python", "local_disk_sufficient")
+            if not compatibility[key]
+        ]
+        if (
+            config["carla"]["server"]["mode"] == "managed"
+            and compatibility["gpu_vulkan_error"]
+        ):
+            failures.append("gpu_vulkan")
+        if failures:
+            raise RuntimeError(
+                "Runtime compatibility checks failed: %s. %s"
+                % (
+                    ", ".join(failures),
+                    compatibility["gpu_vulkan_error"],
+                )
+            )
+
+
+def validate_provisioning_platform(config):
+    package = config["carla"]["package"]
+    failures = []
+    if platform.system() != "Linux":
+        failures.append("Linux is required (found %s)." % platform.system())
+    if platform.machine().lower() not in ("x86_64", "amd64"):
+        failures.append(
+            "x86_64/amd64 is required (found %s)." % platform.machine()
+        )
+    if not (
+        sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12
+    ):
+        failures.append(
+            "Python 3.10 through 3.12 is required (found %s.%s)."
+            % (sys.version_info.major, sys.version_info.minor)
+        )
+    probe = Path("/content") if Path("/content").exists() else Path(
+        package["local_archive"]
+    )
+    free = disk_free_gb(probe)
+    required = float(package["minimum_free_disk_gb"])
+    if free < required:
+        failures.append(
+            "Local VM disk has %.2f GiB free; %.2f GiB is required. The local "
+            "VM must temporarily hold both the compressed archive and extracted "
+            "CARLA package. Local archive: %s. Extraction staging path: %s."
+            % (
+                free,
+                required,
+                package["local_archive"],
+                package["extraction_staging_root"],
+            )
+        )
+    if failures:
+        raise RuntimeError("Provisioning compatibility failed:\n- " + "\n- ".join(failures))
+    return {"local_free_gb": free, "minimum_free_disk_gb": required}
+
+
+def copy_file_with_progress(source, destination):
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total = source.stat().st_size
+    copied = 0
+    next_report = 10
+    with source.open("rb") as reader, destination.open("wb") as writer:
+        while True:
+            chunk = reader.read(16 * 1024 * 1024)
+            if not chunk:
+                break
+            writer.write(chunk)
+            copied += len(chunk)
+            percent = int(100 * copied / max(total, 1))
+            if percent >= next_report:
+                print("Copy progress: %s%%" % percent)
+                next_report += 10
+    shutil.copystat(source, destination)
+
+
+def download_archive(url, part_path):
+    global NETWORK_ACQUISITION_CALLS
+
+    NETWORK_ACQUISITION_CALLS += 1
+    part_path = Path(part_path)
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    aria2 = shutil.which("aria2c")
+    resolved_url = ""
+    if aria2:
+        command = [
+            aria2,
+            "--continue=true",
+            "--max-tries=8",
+            "--retry-wait=5",
+            "--timeout=30",
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--dir=%s" % part_path.parent,
+            "--out=%s" % part_path.name,
+            url,
+        ]
+        print("Downloading with aria2c:", url)
+        subprocess.run(command, check=True)
+    else:
+        curl = shutil.which("curl")
+        if not curl:
+            raise RuntimeError("Install aria2 or curl before provisioning CARLA.")
+        command = [
+            curl,
+            "-L",
+            "--fail",
+            "--retry",
+            "8",
+            "--retry-delay",
+            "5",
+            "--retry-all-errors",
+            "--continue-at",
+            "-",
+            "--output",
+            str(part_path),
+            "--write-out",
+            "%{url_effective}",
+            url,
+        ]
+        print("Downloading with curl:", url)
+        result = subprocess.run(command, check=True, text=True, capture_output=True)
+        resolved_url = result.stdout.strip()
+        if result.stderr:
+            print(result.stderr[-2000:])
+    return resolved_url
+
+
+def validate_drive_metadata(metadata, drive_archive, version):
+    if not metadata:
+        return False, "metadata is absent or invalid JSON"
+    required = ("carla_version", "byte_size", "sha256")
+    missing = [key for key in required if key not in metadata]
+    if missing:
+        return False, "metadata is missing %s" % ", ".join(missing)
+    if str(metadata["carla_version"]) != str(version):
+        return False, "metadata CARLA version does not match"
+    if not Path(drive_archive).is_file():
+        return False, "Drive archive is absent"
+    if Path(drive_archive).stat().st_size != int(metadata["byte_size"]):
+        return False, "Drive archive size does not match metadata"
+    return True, ""
+
+
+def cache_archive_to_drive(config, local_archive, validation, metadata):
+    package = config["carla"]["package"]
+    drive_archive = Path(package["drive_archive"])
+    drive_metadata = Path(package["drive_metadata"])
+    drive_archive.parent.mkdir(parents=True, exist_ok=True)
+    temporary_archive = drive_archive.with_name(drive_archive.name + ".part")
+    temporary_metadata = drive_metadata.with_name(drive_metadata.name + ".part")
+    if temporary_archive.exists():
+        temporary_archive.unlink()
+    copy_file_with_progress(local_archive, temporary_archive)
+    if temporary_archive.stat().st_size != validation["byte_size"]:
+        temporary_archive.unlink(missing_ok=True)
+        raise RuntimeError("Drive archive copy has the wrong byte size.")
+    temporary_archive.replace(drive_archive)
+    metadata = dict(metadata)
+    metadata["drive_cached_at"] = utc_now()
+    temporary_metadata.write_text(
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_metadata.replace(drive_metadata)
+    return True
+
+
+def acquire_carla_archive(config, args):
+    package = config["carla"]["package"]
+    version = str(config["carla"]["version"])
+    local_archive = Path(package["local_archive"])
+    drive_archive = Path(package["drive_archive"])
+    drive_metadata = Path(package["drive_metadata"])
+    validation_path = (
+        ensure_artifact_layout(config)
+        / "logs/runtime/carla_archive_validation.json"
+    )
+
+    def validate_candidate(path):
+        try:
+            result = validate_carla_archive(path, version)
+            write_json(validation_path, result)
+            return result
+        except RuntimeError as exc:
+            write_json(
+                validation_path,
+                {
+                    "valid": False,
+                    "archive": str(path),
+                    "validation_timestamp": utc_now(),
+                    "error": str(exc),
+                },
+            )
+            raise
+
+    use_drive = not args.no_drive_cache
+    drive_validated = False
+    source = ""
+    resolved_url = ""
+
+    if local_archive.is_file() and not args.force_download:
+        try:
+            validation = validate_candidate(local_archive)
+            source = "existing_local_archive"
+            print("Using validated local archive:", local_archive)
+        except RuntimeError as exc:
+            print("Existing local archive is invalid and will be replaced:", exc)
+            local_archive.unlink()
+            validation = None
+    else:
+        validation = None
+
+    if validation is None and use_drive and not args.force_download:
+        metadata = read_json_if_valid(drive_metadata)
+        valid, reason = validate_drive_metadata(metadata, drive_archive, version)
+        if valid:
+            temporary = local_archive.with_name(local_archive.name + ".from-drive.part")
+            temporary.parent.mkdir(parents=True, exist_ok=True)
+            if temporary.exists():
+                temporary.unlink()
+            print("Restoring CARLA archive from Drive:", drive_archive)
+            copy_file_with_progress(drive_archive, temporary)
+            if file_sha256(temporary) != metadata["sha256"]:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "Drive CARLA archive checksum does not match its metadata."
+                )
+            if temporary.stat().st_size != int(metadata["byte_size"]):
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError(
+                    "Drive CARLA archive size changed during restoration."
+                )
+            validation = validate_candidate(temporary)
+            temporary.replace(local_archive)
+            validation["archive"] = str(local_archive)
+            source = "drive_cache"
+            drive_validated = True
+        elif package.get("require_drive_cache"):
+            raise RuntimeError(
+                "No valid Drive cache was found (%s). Run runtime prepare to "
+                "download the official CARLA 0.9.16 archive." % reason
+            )
+        elif drive_archive.exists() or drive_metadata.exists():
+            print("Drive cache is incomplete or invalid; downloading instead:", reason)
+
+    if validation is None:
+        part = local_archive.with_name(local_archive.name + ".part")
+        if args.force_download and part.exists():
+            part.unlink()
+            print("Removed an old partial file for a clean forced download:", part)
+        resolved_url = download_archive(package["download_url"], part)
+        validation = validate_candidate(part)
+        part.replace(local_archive)
+        validation["archive"] = str(local_archive)
+        source = "official_download"
+
+    metadata = {
+        "carla_version": version,
+        "requested_url": package["download_url"],
+        "resolved_url": resolved_url,
+        "filename": local_archive.name,
+        "byte_size": validation["byte_size"],
+        "sha256": validation["sha256"],
+        "download_timestamp": utc_now() if source == "official_download" else "",
+        "validation_timestamp": validation["validated_at"],
+        "platform": platform.platform(),
+        "source": source,
+        "local_sha256": validation["sha256"],
+        "local_mtime_ns": local_archive.stat().st_mtime_ns,
+    }
+    write_json(validation_path, {**validation, "source": source})
+    if use_drive and source != "drive_cache":
+        drive_parent = nearest_existing_parent(drive_archive)
+        drive_looks_mounted = Path("/content/drive/MyDrive").is_dir()
+        if drive_looks_mounted or drive_archive.parent.exists():
+            print("Caching validated archive in Drive:", drive_archive)
+            drive_validated = cache_archive_to_drive(
+                config, local_archive, validation, metadata
+            )
+        elif package.get("require_drive_cache"):
+            raise RuntimeError(
+                "Google Drive is not mounted, but require_drive_cache is enabled."
+            )
+        else:
+            print(
+                "Google Drive is not mounted; continuing with the validated "
+                "local archive only."
+            )
+    local_metadata = validation_path.with_name("CARLA_0.9.16.local.metadata.json")
+    write_json(local_metadata, metadata)
+    return validation, source, drive_validated
+
+
+def install_packaged_carla_wheel(config, wheel, dry_run=False):
+    wheel = Path(wheel)
+    output_path = (
+        ensure_artifact_layout(config)
+        / "logs/runtime/carla_client_install.json"
+    )
+    report = {
+        "timestamp": utc_now(),
+        "python": sys.version,
+        "python_tag": python_tag(),
+        "candidate_wheels": [
+            item.name
+            for item in discover_wheels(config["carla"]["package"]["local_root"])
+        ],
+        "selected_wheel": str(wheel),
+        "dry_run": bool(dry_run),
+    }
+    if not dry_run:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--force-reinstall",
+                "--no-deps",
+                str(wheel),
+            ],
+            check=True,
+        )
+        verification = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import importlib.metadata, json; import carla; "
+                    "print(json.dumps({'distribution_version': "
+                    "importlib.metadata.version('carla'), 'module': carla.__file__}))"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        verified = json.loads(verification.stdout.strip().splitlines()[-1])
+        report.update(verified)
+        if verified["distribution_version"] != str(config["carla"]["version"]):
+            raise RuntimeError(
+                "Installed CARLA distribution is %s, expected %s."
+                % (
+                    verified["distribution_version"],
+                    config["carla"]["version"],
+                )
+            )
+    write_json(output_path, report)
+    return report
+
+
+def extract_carla_package(config, archive, validation, force=False):
+    package = config["carla"]["package"]
+    final_root = Path(package["local_root"])
+    staging_root = Path(package["extraction_staging_root"])
+    if runtime_manifest_matches(config, validation["sha256"]) and not force:
+        wheel = select_carla_wheel(discover_wheels(final_root))
+        print("Existing CARLA extraction matches archive; skipping extraction.")
+        return wheel, read_json_if_valid(package_manifest_path(config))
+    if final_root.exists():
+        remove_managed_path(config, final_root)
+    if staging_root.exists():
+        remove_managed_path(config, staging_root)
+    staging_root.mkdir(parents=True)
+    try:
+        safe_extract_archive(archive, staging_root)
+        extracted_root = discover_carla_root(staging_root)
+        wheel = select_carla_wheel(discover_wheels(extracted_root))
+        executable = extracted_root / "CarlaUE4.sh"
+        support_binary = (
+            extracted_root
+            / "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
+        )
+        if not support_binary.is_file():
+            raise RuntimeError(
+                "Extracted package is missing CarlaUE4-Linux-Shipping."
+            )
+        executable.chmod(executable.stat().st_mode | 0o111)
+        if extracted_root == staging_root.resolve():
+            staging_root.replace(final_root)
+        else:
+            extracted_root.replace(final_root)
+            remove_managed_path(config, staging_root)
+        wheel = select_carla_wheel(discover_wheels(final_root))
+        manifest = {
+            "carla_version": str(config["carla"]["version"]),
+            "archive_sha256": validation["sha256"],
+            "archive_size": validation["byte_size"],
+            "package_root": str(final_root),
+            "python_wheel": str(wheel),
+            "extracted_at": utc_now(),
+            "python": sys.version,
+            "hostname": socket.gethostname(),
+            "boot_id": linux_boot_id(),
+        }
+        write_json(package_manifest_path(config), manifest)
+        write_json(
+            ensure_artifact_layout(config)
+            / "logs/runtime/carla_package_manifest.json",
+            manifest,
+        )
+        return wheel, manifest
+    except Exception:
+        invalid_marker = staging_root / ".carretera_extraction_invalid"
+        if staging_root.exists():
+            invalid_marker.write_text(utc_now() + "\n", encoding="utf-8")
+        raise
+
+
+def provisioning_plan(config, args):
+    package = config["carla"]["package"]
+    return {
+        "dry_run": bool(args.dry_run),
+        "platform_required": "Linux x86_64/amd64",
+        "python_required": "3.10-3.12",
+        "download_url": package["download_url"],
+        "local_archive": package["local_archive"],
+        "drive_archive": package["drive_archive"],
+        "drive_metadata": package["drive_metadata"],
+        "staging_root": package["extraction_staging_root"],
+        "final_root": package["local_root"],
+        "cache_root": package["local_cache_root"],
+        "force_download": bool(args.force_download),
+        "force_extract": bool(args.force_extract),
+        "use_drive_cache": not args.no_drive_cache,
+        "keep_local_archive": bool(args.keep_local_archive),
+        "will_start_server": False,
+        "next_command": "python run.py server start --config %s" % args.config,
+    }
+
+
+def command_runtime_prepare(args):
+    config = load_config(args.config)
+    artifact_root = ensure_artifact_layout(config)
+    plan = provisioning_plan(config, args)
+    write_json(artifact_root / "logs/runtime/runtime_prepare_plan.json", plan)
+    if args.dry_run:
+        status = build_runtime_status(config)
+        save_runtime_status(config, status)
+        print(json.dumps({"plan": plan, "status": status}, indent=2))
+        print("Dry run only: no network, extraction, installation, or deletion occurred.")
+        return
+    print(
+        json.dumps(
+            {
+                "local_archive": plan["local_archive"],
+                "extraction_staging_root": plan["staging_root"],
+                "final_root": plan["final_root"],
+                "minimum_free_disk_gb": config["carla"]["package"][
+                    "minimum_free_disk_gb"
+                ],
+            },
+            indent=2,
+        )
+    )
+    compatibility = validate_provisioning_platform(config)
+    gpu = gpu_status()
+    vulkan = vulkan_status()
+    error = gpu_vulkan_error(gpu, vulkan)
+    if (
+        config["carla"]["server"]["mode"] == "managed"
+        and error
+        and not args.skip_gpu_vulkan_check
+    ):
+        raise RuntimeError(
+            "%s Use --skip-gpu-vulkan-check only for deliberate non-Colab "
+            "package preparation; managed server start remains protected." % error
+        )
+    package = config["carla"]["package"]
+    local_root = Path(package["local_root"])
+    existing_valid = runtime_manifest_matches(config)
+    source = "existing_extraction"
+    drive_validated = False
+    validation = None
+    if existing_valid and not args.force_download and not args.force_extract:
+        manifest = read_json_if_valid(package_manifest_path(config))
+        validation = {
+            "sha256": manifest["archive_sha256"],
+            "byte_size": manifest["archive_size"],
+        }
+        wheel = select_carla_wheel(discover_wheels(local_root))
+        print("Using existing validated CARLA extraction:", local_root)
+    else:
+        validation, source, drive_validated = acquire_carla_archive(config, args)
+        wheel, manifest = extract_carla_package(
+            config,
+            package["local_archive"],
+            validation,
+            force=args.force_extract or args.force_download,
+        )
+    install_report = install_packaged_carla_wheel(config, wheel)
+    prepared = {
+        "timestamp": utc_now(),
+        "success": True,
+        "compatibility": compatibility,
+        "gpu": gpu,
+        "vulkan": vulkan,
+        "archive_source": source,
+        "archive_sha256": validation["sha256"],
+        "archive_size": validation["byte_size"],
+        "drive_cache_validated": drive_validated,
+        "package_root": str(local_root),
+        "wheel": str(wheel),
+        "client_install": install_report,
+        "next_command": plan["next_command"],
+    }
+    write_json(
+        artifact_root / "logs/runtime/runtime_prepare_manifest.json", prepared
+    )
+    local_archive = Path(package["local_archive"])
+    metadata = read_json_if_valid(package["drive_metadata"])
+    drive_cache_now_valid, _ = validate_drive_metadata(
+        metadata, package["drive_archive"], config["carla"]["version"]
+    )
+    if (
+        local_archive.exists()
+        and drive_cache_now_valid
+        and package["delete_local_archive_after_extract"]
+        and not args.keep_local_archive
+    ):
+        remove_managed_path(config, local_archive)
+        prepared["local_archive_deleted_after_extract"] = True
+        write_json(
+            artifact_root / "logs/runtime/runtime_prepare_manifest.json", prepared
+        )
+    print(json.dumps(prepared, indent=2))
+    print("CARLA is prepared but not started.")
+    print("Next command:", plan["next_command"])
+
+
+def command_runtime_clean_local(args):
+    config = load_config(args.config)
+    package = config["carla"]["package"]
+    targets = [
+        package["local_archive"],
+        package["local_archive"] + ".part",
+        package["local_archive"] + ".from-drive.part",
+        package["extraction_staging_root"],
+        package["local_root"],
+        package["local_cache_root"],
+    ]
+    removed = []
+    for target in targets:
+        path = Path(target)
+        if path.exists():
+            remove_managed_path(config, path, dry_run=args.dry_run)
+            removed.append(str(path))
+    report = {
+        "timestamp": utc_now(),
+        "dry_run": bool(args.dry_run),
+        "removed_or_selected": removed,
+        "drive_archive_untouched": package["drive_archive"],
+    }
+    print(json.dumps(report, indent=2))
+
+
 def command_validate_config(args):
     config = load_config(args.config)
     artifact_root = ensure_artifact_layout(config)
@@ -280,6 +1525,19 @@ def process_alive(pid):
 
 
 def server_record_matches_process(record):
+    try:
+        identity_matches = bool(
+            record.get("hostname") == socket.gethostname()
+            and record.get("boot_id") == linux_boot_id()
+            and Path(record.get("repository_root", "")).resolve()
+            == REPOSITORY_ROOT.resolve()
+            and int(record.get("process_group", -1))
+            == int(record.get("pid", -2))
+        )
+    except (TypeError, ValueError):
+        identity_matches = False
+    if not identity_matches:
+        return False
     if not process_alive(record["pid"]):
         return False
     try:
@@ -291,14 +1549,27 @@ def server_record_matches_process(record):
         )
     except (OSError, subprocess.CalledProcessError):
         return False
-    return "CarlaUE4" in result.stdout
+    expected = str(record.get("executable", ""))
+    expected_binary = str(
+        Path(record.get("carla_root", ""))
+        / "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
+    )
+    return bool(
+        "CarlaUE4" in result.stdout
+        and expected
+        and (expected in result.stdout or expected_binary in result.stdout)
+    )
 
 
 def read_server_record(config):
     path = runtime_pid_file(config)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 def carla_server_executable(config):
@@ -313,7 +1584,26 @@ def carla_server_executable(config):
     return executable
 
 
-def wait_for_carla(config, timeout):
+def tail_file(path, lines=150):
+    try:
+        values = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(values[-lines:])
+    except OSError as exc:
+        return "Unable to read server log: %s" % exc
+
+
+def terminate_owned_process_group(process, grace_seconds=15.0):
+    if process.poll() is not None:
+        return
+    os.killpg(process.pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_seconds
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.25)
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGKILL)
+
+
+def wait_for_carla(config, timeout, process=None, log_path=None):
     try:
         import carla
     except ImportError as exc:
@@ -321,11 +1611,28 @@ def wait_for_carla(config, timeout):
     deadline = time.monotonic() + timeout
     last_error = None
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            recent = tail_file(log_path) if log_path else ""
+            raise RuntimeError(
+                "Managed CARLA exited during startup with code %s.\n"
+                "Recent server log:\n%s" % (process.returncode, recent)
+            )
         try:
             client = carla.Client(config["carla"]["host"], config["carla"]["port"])
             client.set_timeout(2.0)
-            version = client.get_server_version()
-            return version
+            client_version = client.get_client_version()
+            server_version = client.get_server_version()
+            expected = str(config["carla"]["version"])
+            if client_version != expected or server_version != expected:
+                raise ValueError(
+                    "CARLA version mismatch: expected client/server %s, got "
+                    "client %s and server %s."
+                    % (expected, client_version, server_version)
+                )
+            return {
+                "client_version": client_version,
+                "server_version": server_version,
+            }
         except RuntimeError as exc:
             last_error = exc
             time.sleep(1.0)
@@ -342,15 +1649,27 @@ def command_server_start(args):
         raise ValueError(
             "server start is permitted only when carla.server.mode is managed."
         )
+    gpu = gpu_status()
+    vulkan = vulkan_status()
+    compatibility_error = gpu_vulkan_error(gpu, vulkan)
+    if compatibility_error and not args.skip_gpu_vulkan_check:
+        raise RuntimeError(compatibility_error)
     previous = read_server_record(config)
-    if previous and server_record_matches_process(previous):
-        raise RuntimeError("Managed CARLA is already running with PID %s." % previous["pid"])
+    previous_state = server_record_state(config, previous)
+    if previous_state["active"]:
+        raise RuntimeError(
+            "Managed CARLA is already running with PID %s." % previous["pid"]
+        )
+    if previous:
+        runtime_pid_file(config).unlink(missing_ok=True)
+        if previous_state["stale"]:
+            print("Removed a stale managed-server record from another runtime.")
     executable = carla_server_executable(config)
     quality_key = "quality_rendering" if args.rendering else "quality_training"
     quality = config["carla"]["server"][quality_key]
     command = [
         str(executable),
-        "-carla-port=%s" % config["carla"]["port"],
+        "-carla-rpc-port=%s" % config["carla"]["port"],
         "-quality-level=%s" % quality,
     ]
     offscreen_key = "rendering_offscreen" if args.rendering else "training_offscreen"
@@ -365,43 +1684,76 @@ def command_server_start(args):
         / ("carla_server_%s.log" % timestamp)
     )
     log_handle = log_path.open("ab")
+    package = config["carla"]["package"]
+    cache_root = Path(package["local_cache_root"])
+    cache_root.mkdir(parents=True, exist_ok=True)
+    process_environment = os.environ.copy()
+    process_environment["CARLA_CACHE_DIR"] = str(cache_root)
     process = subprocess.Popen(
         command,
         cwd=executable.parent,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=process_environment,
     )
     startup_complete = {"value": False}
 
     def cleanup_incomplete_start():
         if not startup_complete["value"] and process_alive(process.pid):
-            os.killpg(process.pid, signal.SIGTERM)
+            terminate_owned_process_group(process)
 
     atexit.register(cleanup_incomplete_start)
     record = {
         "pid": process.pid,
         "process_group": process.pid,
+        "hostname": socket.gethostname(),
+        "boot_id": linux_boot_id(),
         "started_at": utc_now(),
         "command": command,
         "log": str(log_path),
         "rendering": bool(args.rendering),
         "executable": str(executable),
+        "repository_root": str(REPOSITORY_ROOT),
+        "carla_root": str(executable.parent),
+        "cache_root": str(cache_root),
     }
     write_json(runtime_pid_file(config), record)
     try:
-        version = wait_for_carla(
-            config, config["carla"]["server"]["startup_timeout_seconds"]
+        versions = wait_for_carla(
+            config,
+            config["carla"]["server"]["startup_timeout_seconds"],
+            process=process,
+            log_path=log_path,
         )
-    except Exception:
-        if process_alive(process.pid):
-            os.killpg(process.pid, signal.SIGTERM)
-        raise
+    except Exception as exc:
+        terminate_owned_process_group(process)
+        runtime_pid_file(config).unlink(missing_ok=True)
+        details = (
+            "%s\nServer command: %s\nLog: %s\nGPU: %s\nVulkan: %s\n"
+            "Recent server log:\n%s"
+            % (
+                exc,
+                " ".join(command),
+                log_path,
+                json.dumps(gpu),
+                json.dumps(vulkan),
+                tail_file(log_path),
+            )
+        )
+        raise RuntimeError(details) from exc
     finally:
         log_handle.close()
     startup_complete["value"] = True
     atexit.unregister(cleanup_incomplete_start)
-    print("Managed CARLA started with PID %s, server version %s." % (process.pid, version))
+    print(
+        "Managed CARLA started with PID %s, client/server version %s/%s."
+        % (
+            process.pid,
+            versions["client_version"],
+            versions["server_version"],
+        )
+    )
     print("Log:", log_path)
 
 
@@ -411,23 +1763,37 @@ def command_server_status(args):
     if not record:
         print("No repository-owned managed CARLA process is recorded.")
         return
-    state = (
-        "running"
-        if server_record_matches_process(record)
-        else "not running or identity mismatch"
-    )
-    print("Managed CARLA PID %s is %s." % (record["pid"], state))
+    state = server_record_state(config, record)
+    print("Managed CARLA PID %s state: %s." % (record.get("pid"), state["state"]))
     print(json.dumps(record, indent=2))
+    if state["stale"]:
+        runtime_pid_file(config).unlink(missing_ok=True)
+        print("Removed the stale local record; no process was signaled.")
 
 
 def command_server_stop(args):
     config = load_config(args.config)
+    if config["carla"]["server"]["mode"] != "managed":
+        raise ValueError("server stop never acts on an external CARLA server.")
     record = read_server_record(config)
     if not record:
         print("No repository-owned managed CARLA process is recorded; nothing stopped.")
         return
-    pid = int(record["pid"])
-    if process_alive(pid) and not server_record_matches_process(record):
+    state = server_record_state(config, record)
+    if state["stale"]:
+        runtime_pid_file(config).unlink(missing_ok=True)
+        print(
+            "Removed stale managed-server record from another runtime; no "
+            "local process was signaled."
+        )
+        return
+    try:
+        pid = int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        runtime_pid_file(config).unlink(missing_ok=True)
+        print("Removed an invalid managed-server record; no process was signaled.")
+        return
+    if process_alive(pid) and not state["active"]:
         raise RuntimeError(
             "Recorded PID %s no longer identifies a CarlaUE4 process; refusing "
             "to signal an unrelated process." % pid
@@ -466,6 +1832,8 @@ def gpu_information():
 def command_doctor(args):
     config = load_config(args.config)
     artifact_root = ensure_artifact_layout(config)
+    runtime = build_runtime_status(config, check_server=True)
+    save_runtime_status(config, runtime)
     disk = shutil.disk_usage(artifact_root)
     report = {
         "repository_root": str(REPOSITORY_ROOT),
@@ -479,6 +1847,8 @@ def command_doctor(args):
         "carla_root": config["carla"]["server"].get("root", ""),
         "carla_root_valid": False,
         "server_reachable": False,
+        "runtime_compatibility": runtime["compatibility"],
+        "runtime": runtime,
     }
     try:
         import torch
@@ -491,7 +1861,29 @@ def command_doctor(args):
     root = config["carla"]["server"].get("root", "")
     if root:
         report["carla_root_valid"] = (resolve_path(root) / "CarlaUE4.sh").is_file()
+    doctor_path = artifact_root / "logs/runtime/doctor.json"
     print(json.dumps(report, indent=2))
+    if (
+        config["carla"]["server"]["mode"] == "managed"
+        and runtime["compatibility"]["gpu_vulkan_error"]
+    ):
+        write_json(doctor_path, report)
+        raise RuntimeError(runtime["compatibility"]["gpu_vulkan_error"])
+    if (
+        config["carla"]["server"]["mode"] == "managed"
+        and not report["carla_root_valid"]
+    ):
+        write_json(doctor_path, report)
+        raise RuntimeError(
+            "Managed CARLA is not prepared. Run: python run.py runtime prepare "
+            "--config %s" % args.config
+        )
+    if not runtime["python_client"]["import_success"]:
+        write_json(doctor_path, report)
+        raise RuntimeError(
+            "The CARLA Python client is unavailable. Run: python run.py runtime "
+            "prepare --config %s" % args.config
+        )
     try:
         with socket.create_connection(
             (config["carla"]["host"], config["carla"]["port"]), timeout=3.0
@@ -499,11 +1891,17 @@ def command_doctor(args):
             report["tcp_connection"] = "ok"
     except OSError as exc:
         report["tcp_connection"] = "failed: %s" % exc
-        write_json(artifact_root / "logs/runtime/doctor.json", report)
+        write_json(doctor_path, report)
         raise ConnectionError(
-            "CARLA TCP connection failed at %s:%s. Start CARLA 0.9.16 or set "
-            "CARLA_HOST/CARLA_PORT. Details: %s"
-            % (config["carla"]["host"], config["carla"]["port"], exc)
+            "CARLA TCP connection failed at %s:%s. Run: python run.py server "
+            "start --config %s. For external mode, set CARLA_HOST/CARLA_PORT. "
+            "Details: %s"
+            % (
+                config["carla"]["host"],
+                config["carla"]["port"],
+                args.config,
+                exc,
+            )
         ) from exc
 
     env = None
@@ -535,7 +1933,7 @@ def command_doctor(args):
     finally:
         if env is not None:
             env.close()
-    write_json(artifact_root / "logs/runtime/doctor.json", report)
+    write_json(doctor_path, report)
     print(json.dumps(report, indent=2))
 
 
@@ -617,6 +2015,27 @@ def latex_escape(value):
     return "".join(replacements.get(character, character) for character in str(value))
 
 
+def sync_path_excluded(relative):
+    relative = Path(relative)
+    lowered = [part.lower() for part in relative.parts]
+    normalized = relative.as_posix().lower()
+    if normalized == "logs/runtime/carla_server.json":
+        return True
+    if any(
+        part.startswith("carla_0.9.16")
+        or part in ("carla_cache", ".carla_cache", "shader_cache")
+        for part in lowered
+    ):
+        return True
+    name = relative.name.lower()
+    if (
+        name.startswith("carla_")
+        and (name.endswith(".tar.gz") or ".tar.gz." in name)
+    ):
+        return True
+    return False
+
+
 def sync_directories(source, destination, dry_run=False):
     source = Path(source).resolve()
     destination = Path(destination).resolve()
@@ -628,34 +2047,43 @@ def sync_directories(source, destination, dry_run=False):
     if not source.exists():
         return {"copied": 0, "skipped": 0, "errors": 0, "source_missing": True}
     counts = {"copied": 0, "skipped": 0, "errors": 0, "source_missing": False}
-    for source_path in sorted(source.rglob("*")):
-        if source_path.is_symlink():
-            counts["skipped"] += 1
-            continue
-        relative = source_path.relative_to(source)
-        destination_path = destination / relative
-        if source_path.is_dir():
-            if not dry_run:
-                destination_path.mkdir(parents=True, exist_ok=True)
-            continue
-        try:
-            needs_copy = (
-                not destination_path.exists()
-                or source_path.stat().st_size != destination_path.stat().st_size
-                or source_path.stat().st_mtime > destination_path.stat().st_mtime + 1e-6
-            )
-            if needs_copy:
-                if not dry_run:
-                    destination_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source_path, destination_path)
-                counts["copied"] += 1
-            else:
+    for current, directory_names, file_names in os.walk(source, topdown=True):
+        current = Path(current)
+        retained = []
+        for name in sorted(directory_names):
+            source_path = current / name
+            relative = source_path.relative_to(source)
+            if source_path.is_symlink() or sync_path_excluded(relative):
                 counts["skipped"] += 1
-        except OSError as exc:
-            counts["errors"] += 1
-            warnings.warn(
-                "Sync failed for %s: %s" % (source_path, exc), RuntimeWarning
-            )
+            else:
+                retained.append(name)
+        directory_names[:] = retained
+        for name in sorted(file_names):
+            source_path = current / name
+            relative = source_path.relative_to(source)
+            if source_path.is_symlink() or sync_path_excluded(relative):
+                counts["skipped"] += 1
+                continue
+            destination_path = destination / relative
+            try:
+                needs_copy = (
+                    not destination_path.exists()
+                    or source_path.stat().st_size != destination_path.stat().st_size
+                    or source_path.stat().st_mtime
+                    > destination_path.stat().st_mtime + 1e-6
+                )
+                if needs_copy:
+                    if not dry_run:
+                        destination_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source_path, destination_path)
+                    counts["copied"] += 1
+                else:
+                    counts["skipped"] += 1
+            except OSError as exc:
+                counts["errors"] += 1
+                warnings.warn(
+                    "Sync failed for %s: %s" % (source_path, exc), RuntimeWarning
+                )
     return counts
 
 
@@ -663,7 +2091,11 @@ def command_sync(args):
     config = load_config(args.config)
     local_root = resolve_path(args.local_root or config["paths"]["artifact_root"])
     drive_root = resolve_path(args.drive_root or config["paths"]["drive_root"])
-    if local_root == REPOSITORY_ROOT or (local_root / ".git").exists():
+    if (
+        local_root == REPOSITORY_ROOT
+        or local_root in REPOSITORY_ROOT.parents
+        or (local_root / ".git").exists()
+    ):
         raise ValueError(
             "Refusing to sync the repository itself; choose the artifacts root."
         )
@@ -702,6 +2134,7 @@ def command_offline_self_test(args):
     config = load_config(args.config)
     artifact_root = ensure_artifact_layout(config)
     tests = {}
+    network_calls_before = NETWORK_ACQUISITION_CALLS
     tests["yaml_loading"] = config["project"]["name"] == "carla_highway_rl"
     original = os.environ.get("CARLA_PORT")
     try:
@@ -771,6 +2204,188 @@ def command_offline_self_test(args):
             sync_result["copied"] == 1
             and not Path(second, "sample.txt").exists()
         )
+    tests["safe_path_deletion_rules"] = bool(
+        not safe_managed_path(config, "/")
+        and not safe_managed_path(config, "/content")
+        and not safe_managed_path(config, REPOSITORY_ROOT)
+        and not safe_managed_path(config, config["paths"]["drive_root"])
+        and safe_managed_path(
+            config, config["carla"]["package"]["local_archive"]
+        )
+        and safe_managed_path(
+            config, config["carla"]["package"]["local_cache_root"]
+        )
+    )
+    expected_drive_archive = (
+        Path(config["paths"]["drive_root"])
+        / config["carla"]["package"]["drive_cache_subdirectory"]
+        / config["carla"]["package"]["archive_name"]
+    ).resolve()
+    tests["drive_archive_path_derivation"] = (
+        Path(config["carla"]["package"]["drive_archive"])
+        == expected_drive_archive
+        and Path(config["carla"]["package"]["drive_metadata"])
+        == expected_drive_archive.with_name(
+            config["carla"]["package"]["metadata_name"]
+        )
+    )
+    override_names = {
+        "CARLA_ARCHIVE_URL": "https://example.invalid/carla.tar.gz",
+        "CARLA_ARCHIVE_LOCAL": "/content/CARLA_0.9.16.override.tar.gz",
+        "CARLA_ARCHIVE_DRIVE": (
+            "/content/drive/MyDrive/test/CARLA_0.9.16.tar.gz"
+        ),
+        "CARLA_ROOT": "/content/CARLA_0.9.16.override",
+        "CARLA_CACHE_DIR": "/content/carla_cache",
+    }
+    originals = {name: os.environ.get(name) for name in override_names}
+    try:
+        os.environ.update(override_names)
+        override_config = load_config(args.config)
+        tests["package_environment_overrides"] = bool(
+            override_config["carla"]["package"]["download_url"]
+            == override_names["CARLA_ARCHIVE_URL"]
+            and override_config["carla"]["package"]["local_archive"]
+            == override_names["CARLA_ARCHIVE_LOCAL"]
+            and override_config["carla"]["package"]["drive_archive"]
+            == override_names["CARLA_ARCHIVE_DRIVE"]
+            and override_config["carla"]["package"]["local_root"]
+            == override_names["CARLA_ROOT"]
+            and override_config["carla"]["server"]["root"]
+            == override_names["CARLA_ROOT"]
+        )
+    finally:
+        for name, value in originals.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    with tempfile.TemporaryDirectory() as temporary:
+        temporary = Path(temporary)
+        metadata_path = temporary / "metadata.json"
+        metadata_value = {
+            "carla_version": "0.9.16",
+            "byte_size": 123,
+            "sha256": "abc123",
+        }
+        write_json(metadata_path, metadata_value)
+        tests["archive_metadata_round_trip"] = (
+            read_json_if_valid(metadata_path) == metadata_value
+        )
+        hash_path = temporary / "hash.txt"
+        hash_path.write_bytes(b"deterministic")
+        tests["sha256_determinism"] = (
+            file_sha256(hash_path)
+            == file_sha256(hash_path)
+            == "0badac3c6df445ad3aea62da1350683923aba37c685978afed96a515d12921a3"
+        )
+        traversal_path = temporary / "traversal.tar.gz"
+        with tarfile.open(traversal_path, "w:gz") as archive:
+            member = tarfile.TarInfo("../escape.txt")
+            payload = b"escape"
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+        try:
+            validate_carla_archive(traversal_path, allow_small=True)
+            traversal_rejected = False
+        except RuntimeError as exc:
+            traversal_rejected = "unsafe" in str(exc).lower()
+        tests["path_traversal_tar_rejected"] = traversal_rejected
+        flat_names = [
+            "CarlaUE4.sh",
+            "PythonAPI/carla/dist/carla-0.9.16-cp311-cp311-linux_x86_64.whl",
+            "CarlaUE4/Content/Carla/Maps/Town04.umap",
+        ]
+        nested_names = ["CARLA_0.9.16/" + name for name in flat_names]
+        tests["flat_archive_root_discovery"] = (
+            archive_root_from_names(flat_names) == "."
+        )
+        tests["nested_archive_root_discovery"] = (
+            archive_root_from_names(nested_names) == "CARLA_0.9.16"
+        )
+        wheel_selection_results = []
+        for tag in ("cp310", "cp311", "cp312"):
+            candidate = temporary / (
+                "carla-0.9.16-%s-%s-manylinux_2_31_x86_64.whl" % (tag, tag)
+            )
+            wheel_selection_results.append(
+                select_carla_wheel([candidate], tag=tag) == candidate
+            )
+        tests["wheel_selection_cp310_cp311_cp312"] = all(
+            wheel_selection_results
+        )
+        ambiguous = [
+            temporary
+            / "carla-0.9.16-cp311-cp311-linux_x86_64.whl",
+            temporary
+            / "carla-0.9.16-cp311-cp311-manylinux_x86_64.whl",
+        ]
+        try:
+            select_carla_wheel(ambiguous, tag="cp311")
+            ambiguous_rejected = False
+        except RuntimeError:
+            ambiguous_rejected = True
+        tests["ambiguous_wheel_rejected"] = ambiguous_rejected
+        stale_record = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "boot_id": "definitely-another-boot",
+            "repository_root": str(REPOSITORY_ROOT),
+            "executable": "/content/CARLA_0.9.16/CarlaUE4.sh",
+        }
+        tests["stale_server_record_detection"] = server_record_state(
+            config, stale_record
+        )["stale"]
+        manifest_config = copy.deepcopy(config)
+        manifest_root = temporary / "CARLA_0.9.16"
+        (manifest_root / "PythonAPI/carla/dist").mkdir(parents=True)
+        (manifest_root / "CarlaUE4.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        manifest_config["carla"]["package"]["local_root"] = str(manifest_root)
+        manifest_config["carla"]["server"]["root"] = str(manifest_root)
+        write_json(
+            package_manifest_path(manifest_config),
+            {
+                "carla_version": "0.9.16",
+                "archive_sha256": "synthetic",
+                "archive_size": 123,
+                "package_root": str(manifest_root),
+            },
+        )
+        tests["runtime_manifest_comparison"] = runtime_manifest_matches(
+            manifest_config, "synthetic"
+        )
+        source = temporary / "sync_source"
+        destination = temporary / "sync_destination"
+        (source / "logs/runtime").mkdir(parents=True)
+        (source / "logs/runtime/carla_server.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (source / "logs/runtime/keep.json").write_text("{}", encoding="utf-8")
+        sync_directories(source, destination)
+        tests["sync_excludes_active_pid"] = bool(
+            not (destination / "logs/runtime/carla_server.json").exists()
+            and (destination / "logs/runtime/keep.json").exists()
+        )
+    dry_args = argparse.Namespace(
+        config=args.config,
+        dry_run=True,
+        force_download=False,
+        force_extract=False,
+        no_drive_cache=False,
+        keep_local_archive=False,
+    )
+    dry_plan = provisioning_plan(config, dry_args)
+    tests["provisioning_dry_run"] = bool(
+        dry_plan["dry_run"] and not dry_plan["will_start_server"]
+    )
+    tests["colab_path_resolution"] = bool(
+        Path(config["carla"]["package"]["local_root"]).is_absolute()
+        and str(config["carla"]["package"]["local_root"]).startswith("/content/")
+        and str(config["carla"]["package"]["drive_archive"]).startswith(
+            "/content/drive/MyDrive/"
+        )
+    )
+    tests["no_network_call"] = NETWORK_ACQUISITION_CALLS == network_calls_before
     report_paths = generate_report_data(config)
     tests["report_macro_generation"] = all(path.exists() for path in report_paths)
     success = all(tests.values())
@@ -962,6 +2577,10 @@ def training_metadata(config, run_name, seed, started_at):
         "run_name": run_name,
         "seed": seed,
         "started_at": started_at,
+        "carla_version": str(config["carla"]["version"]),
+        "carla_package_manifest": read_json_if_valid(
+            package_manifest_path(config)
+        ),
         "config_hash": config_hash(config),
         "packages": package_versions(),
         "git": git_metadata(),
@@ -1956,6 +3575,8 @@ def command_render_videos(args):
             args.resume_existing
             and output.exists()
             and output.stat().st_size > 1024
+            and int(selection.get("frame_count", 0)) > 0
+            and float(selection.get("duration", 0.0)) > 0.0
         ):
             print("Skipping existing video:", output)
             continue
@@ -2226,7 +3847,11 @@ def command_smoke(args):
                 "timestamp": utc_now(),
                 "render_frame": "passed",
                 "shape": list(frame.shape),
+                "frame_id": env.last_render_frame_id,
                 "simulator_frames_received": len(env.drain_render_frames()),
+                "world_no_rendering_mode": bool(
+                    env.world.get_settings().no_rendering_mode
+                ),
             }
             write_json(
                 artifact_root / "logs/runtime/render_frame_smoke.json", result
@@ -2284,11 +3909,42 @@ def build_parser():
     doctor.add_argument("--config", default="config.yaml")
     doctor.set_defaults(function=command_doctor)
 
+    runtime = subparsers.add_parser(
+        "runtime", help="Inspect or provision the hosted CARLA runtime."
+    )
+    runtime_subparsers = runtime.add_subparsers(
+        dest="runtime_command", required=True
+    )
+    runtime_status = runtime_subparsers.add_parser("status")
+    runtime_status.add_argument("--config", default="config.yaml")
+    runtime_status.add_argument("--verify-archive-hash", action="store_true")
+    runtime_status.add_argument("--check-server", action="store_true")
+    runtime_status.add_argument("--strict", action="store_true")
+    runtime_status.set_defaults(function=command_runtime_status)
+    runtime_prepare = runtime_subparsers.add_parser("prepare")
+    runtime_prepare.add_argument("--config", default="config.yaml")
+    runtime_prepare.add_argument("--force-download", action="store_true")
+    runtime_prepare.add_argument("--force-extract", action="store_true")
+    runtime_prepare.add_argument("--dry-run", action="store_true")
+    runtime_prepare.add_argument("--no-drive-cache", action="store_true")
+    runtime_prepare.add_argument("--keep-local-archive", action="store_true")
+    runtime_prepare.add_argument(
+        "--skip-gpu-vulkan-check", action="store_true"
+    )
+    runtime_prepare.set_defaults(function=command_runtime_prepare)
+    runtime_clean = runtime_subparsers.add_parser("clean-local")
+    runtime_clean.add_argument("--config", default="config.yaml")
+    runtime_clean.add_argument("--dry-run", action="store_true")
+    runtime_clean.set_defaults(function=command_runtime_clean_local)
+
     server = subparsers.add_parser("server")
     server_subparsers = server.add_subparsers(dest="server_command", required=True)
     server_start = server_subparsers.add_parser("start")
     server_start.add_argument("--config", default="config.yaml")
     server_start.add_argument("--rendering", action="store_true")
+    server_start.add_argument(
+        "--skip-gpu-vulkan-check", action="store_true"
+    )
     server_start.set_defaults(function=command_server_start)
     server_status = server_subparsers.add_parser("status")
     server_status.add_argument("--config", default="config.yaml")

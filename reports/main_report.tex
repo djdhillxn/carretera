@@ -139,6 +139,14 @@ nonparametric bootstrap intervals quantify continuous and paired differences.
 The model seed is \ModelSeed{}, the manifest hash is \ManifestHash{}, and the
 recorded training budget is \TrainingDecisions{} decisions.
 
+\subsection{Execution reproducibility}
+Experiments run in a hosted Colab GPU VM with packaged CARLA 0.9.16 extracted
+to ephemeral local storage. A validated archive and experiment artifacts are
+persisted separately in Google Drive. Training is checkpointed in
+5,000-decision chunks and evaluation in restartable paired slices; resolved
+configuration, package versions, archive hash, manifest hash, hostname, and
+runtime metadata are retained with the artifacts.
+
 \section{Results}
 The current evaluation row count is \EvaluationEpisodes{}. PPO success is
 \PPOSuccessRate{} (95\% CI \PPOSuccessCI{}), collision is
