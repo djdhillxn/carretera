@@ -1,0 +1,199 @@
+project:
+  name: carla_highway_rl
+  title: Reinforcement Learning for Highway Tactical Decision-Making in CARLA
+  default_seed: 0
+
+paths:
+  artifact_root: artifacts
+  drive_root: /content/drive/MyDrive/CARLA_Highway_RL
+
+carla:
+  version: "0.9.16"
+  host: "127.0.0.1"
+  port: 2000
+  traffic_manager_port: 8000
+  client_timeout_seconds: 30
+  map: Town04
+  fixed_delta_seconds: 0.05
+  synchronous_mode: true
+
+  server:
+    mode: external
+    root: ""
+    quality_training: Low
+    quality_rendering: Epic
+    startup_timeout_seconds: 90
+    training_offscreen: true
+    rendering_offscreen: true
+    training_no_rendering_mode: true
+    rendering_no_rendering_mode: false
+    sound: false
+
+environment:
+  decision_interval_seconds: 1.0
+  action_repeat_ticks: 20
+  target_route_distance_m: 1000.0
+  max_episode_seconds: 90.0
+  stuck_speed_kmh: 2.0
+  stuck_timeout_seconds: 8.0
+  initial_target_speed_kmh: 65.0
+  min_target_speed_kmh: 20.0
+  max_target_speed_kmh: 90.0
+  speed_action_delta_kmh: 5.0
+  neighbor_radius_m: 80.0
+  lane_change_completion_offset_m: 0.45
+  lane_change_completion_ticks: 5
+  lane_change_lookahead_m: 25.0
+  offroad_grace_ticks: 3
+  ego_vehicle_filter: vehicle.tesla.model3
+  highway_candidate_index: null
+  highway_continuity_distance_m: 250.0
+  minimum_actual_npcs: 3
+
+controller:
+  waypoint_spacing_m: 2.0
+  min_lookahead_m: 5.0
+  max_lookahead_m: 15.0
+  lookahead_speed_factor: 0.35
+  max_steer: 0.8
+  max_steer_change_per_tick: 0.12
+  lateral_kp: 1.2
+  lateral_ki: 0.0
+  lateral_kd: 0.18
+  speed_kp: 0.35
+  speed_ki: 0.03
+  speed_kd: 0.05
+  max_throttle: 0.75
+  max_brake: 0.9
+
+  following:
+    enabled: true
+    minimum_gap_m: 7.0
+    time_headway_seconds: 1.25
+    emergency_ttc_seconds: 1.0
+    emergency_gap_m: 5.0
+
+lane_change:
+  minimum_front_gap_m: 18.0
+  minimum_rear_gap_m: 12.0
+  minimum_rear_ttc_seconds: 3.0
+  reject_illegal_actions: true
+  reject_unsafe_actions: true
+  prefer_left_for_overtaking: true
+
+traffic:
+  density_counts:
+    low: 8
+    medium: 16
+    high: 24
+  training_density_choices:
+    - low
+    - medium
+    - high
+  background_spawn_radius_m: 600.0
+  structured_lead_vehicle: true
+  lead_distance_range_m:
+    - 25.0
+    - 45.0
+  lead_speed_range_kmh:
+    - 35.0
+    - 50.0
+  npc_speed_range_kmh:
+    - 40.0
+    - 85.0
+  npc_following_distance_range_m:
+    - 1.5
+    - 3.5
+  npc_auto_lane_change: true
+  training_weather: ClearNoon
+
+reward:
+  progress_scale_m: 10.0
+  progress_weight: 1.0
+  speed_weight: 0.10
+  collision_penalty: -50.0
+  offroad_penalty: -30.0
+  stuck_penalty: -10.0
+  unsafe_lane_change_penalty: -2.0
+  accepted_lane_change_cost: -0.05
+
+ppo:
+  policy: MlpPolicy
+  total_timesteps: 50000
+  first_stage_timesteps: 25000
+  learning_rate: 0.0003
+  n_steps: 1024
+  batch_size: 256
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  net_arch:
+    - 128
+    - 128
+  activation: tanh
+  device: cpu
+  checkpoint_frequency: 5000
+  tensorboard: true
+
+evaluation:
+  policies:
+    - ppo
+    - random
+    - keep_lane
+    - rule_based
+  traffic_densities:
+    - low
+    - medium
+    - high
+  weather_presets:
+    - ClearNoon
+    - CloudyNoon
+    - WetCloudyNoon
+  seeds:
+    - 100
+    - 101
+    - 102
+    - 103
+    - 104
+    - 105
+    - 106
+    - 107
+    - 108
+    - 109
+  bootstrap_resamples: 2000
+  quick_seeds:
+    - 100
+    - 101
+    - 102
+
+video:
+  width: 1280
+  height: 720
+  fps: 20
+  field_of_view: 90
+  camera_x: -7.5
+  camera_y: 0.0
+  camera_z: 3.5
+  camera_pitch: -15.0
+  codec: mp4v
+  save_carla_recording: true
+  categories:
+    - ppo_safe_overtake
+    - ppo_rejected_unsafe_lane_change
+    - ppo_dense_traffic_success
+    - keep_lane_blocked
+    - random_failure
+    - ppo_failure
+
+rule_based:
+  blocked_front_gap_m: 32.0
+  blocked_relative_speed_mps: -1.0
+  safe_front_gap_m: 18.0
+  safe_rear_gap_m: 12.0
+  safe_rear_ttc_seconds: 3.0
+  cruise_speed_kmh: 65.0
+  return_right_cooldown_steps: 8

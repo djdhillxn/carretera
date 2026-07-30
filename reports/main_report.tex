@@ -1,0 +1,203 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\IfFileExists{reports/generated/report_values.tex}{
+  \input{reports/generated/report_values.tex}
+}{
+  \IfFileExists{generated/report_values.tex}{
+    \input{generated/report_values.tex}
+  }{
+    \newcommand{\TrainingDecisions}{TBD}
+    \newcommand{\EvaluationEpisodes}{TBD}
+    \newcommand{\PPOSuccessRate}{TBD}
+    \newcommand{\PPOSuccessCI}{TBD}
+    \newcommand{\PPOCollisionRate}{TBD}
+    \newcommand{\PPOCollisionCI}{TBD}
+    \newcommand{\PPORouteCompletion}{TBD}
+    \newcommand{\PPOAverageSpeed}{TBD}
+    \newcommand{\PPOCompletionTime}{TBD}
+    \newcommand{\StrongestBaseline}{TBD}
+    \newcommand{\PairedSuccessDifference}{TBD}
+    \newcommand{\PairedCollisionDifference}{TBD}
+    \newcommand{\ModelSeed}{TBD}
+    \newcommand{\ManifestHash}{TBD}
+    \newcommand{\CARLAVersion}{0.9.16}
+  }
+}
+
+\newcommand{\generatedfigure}[3]{
+  \IfFileExists{reports/generated/#1}{
+    \begin{figure}[ht]
+      \centering
+      \includegraphics[width=#2\linewidth]{reports/generated/#1}
+      \caption{#3}
+    \end{figure}
+  }{
+    \IfFileExists{generated/#1}{
+      \begin{figure}[ht]
+        \centering
+        \includegraphics[width=#2\linewidth]{generated/#1}
+        \caption{#3}
+      \end{figure}
+    }{}
+  }
+}
+
+\title{Reinforcement Learning for Highway Tactical Decision-Making in CARLA}
+\author{Portfolio Project Report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This project evaluates whether state-based PPO can improve highway tactical
+decision-making over random, keep-lane, and transparent rule-based policies in
+closed-loop CARLA evaluation. The policy observes a normalized state vector and
+selects target-speed and target-lane actions, while every policy shares the same
+conventional waypoint/PID controller and minimal car-following override.
+Experiments use paired held-out traffic and weather scenarios. Numerical
+results are inserted only from generated artifacts; until experiments run,
+values remain explicitly marked TBD.
+\end{abstract}
+
+\section{Motivation and Project Question}
+The project asks: \emph{Can a PPO agent learn safer and more efficient highway
+overtaking and lane-change decisions than random, fixed keep-lane, and simple
+rule-based policies under varying CARLA traffic conditions?} The scope is
+highway tactical decision-making, not perception, end-to-end vehicle control,
+or a claim of deployable safety.
+
+\section{CARLA Highway Environment}
+The Gymnasium environment uses CARLA \CARLAVersion{} and Town04 in synchronous
+mode with a 0.05\,s fixed step. Highway starts are discovered from map topology:
+candidates must be non-junction driving lanes, have a legal same-direction
+adjacent lane, and retain sufficient forward continuity. Traffic Manager
+controls seeded NPC traffic, including one structured slower lead vehicle.
+
+\section{Markov Decision Process}
+\subsection{State}
+The observation is a 20-dimensional float vector. Eight ego/lane features
+encode normalized speed, target speed, lateral offset, sine and cosine of
+heading error, adjacent-lane availability, and lane-change activity. Four
+features for each of the left, current, and right lanes encode capped front and
+rear gaps and relative speeds.
+
+\subsection{Actions and timing}
+The five actions are maintain, accelerate, decelerate, change left, and change
+right. A tactical action is selected every 1.0 simulated second and executed
+over 20 low-level ticks. Unsafe or illegal lane-change requests execute as
+maintain and are logged.
+
+\subsection{Reward and termination}
+For decision step \(t\), the deliberately compact reward is
+\[
+ r_t =
+ w_p \frac{\Delta d_t}{d_s}
+ + w_v\,\mathrm{clip}\!\left(\frac{v_t}{v_0},0,1.2\right)
+ + c_{\mathrm{reject}} + c_{\mathrm{accepted}} + c_{\mathrm{terminal}}.
+\]
+Terminal penalties apply only to collision, sustained off-road state, or
+stuck termination. Successful route-distance completion is terminal; the time
+limit truncates an unfinished episode.
+
+\section{Hierarchical Control Design}
+The tactical policy specifies a target lane and speed. A speed-dependent
+lookahead waypoint controller uses lateral and longitudinal PID terms,
+steering-rate limiting, and mutually exclusive throttle and brake. A shared
+car-following override caps speed near a lead vehicle and applies emergency
+braking for a very small gap or TTC. It is identical across policies and is not
+presented as a complete safety system.
+
+\section{PPO and Baselines}
+The state-based PPO policy uses a two-layer \(128\times128\) tanh MLP. Its
+clipped surrogate term follows
+\[
+ L^{\mathrm{clip}}(\theta)=
+ \mathbb{E}_t\!\left[
+ \min\!\left(r_t(\theta)\hat A_t,
+ \mathrm{clip}(r_t(\theta),1-\epsilon,1+\epsilon)\hat A_t\right)
+ \right].
+\]
+The non-learning comparisons are a uniformly random tactical policy, a fixed
+keep-lane policy, and a concise rule-based overtaking policy that checks the
+left lane before the right lane.
+
+\section{Experimental Protocol}
+One frozen manifest pairs every policy on the same three traffic densities,
+three weather presets, and ten held-out seeds. This yields 90 conditions per
+policy and 360 episodes if complete. Primary outcomes include success,
+collision, route completion, speed, successful completion time, lane changes,
+and unsafe requests. Wilson intervals quantify binary rates; seeded
+nonparametric bootstrap intervals quantify continuous and paired differences.
+The model seed is \ModelSeed{}, the manifest hash is \ManifestHash{}, and the
+recorded training budget is \TrainingDecisions{} decisions.
+
+\section{Results}
+The current evaluation row count is \EvaluationEpisodes{}. PPO success is
+\PPOSuccessRate{} (95\% CI \PPOSuccessCI{}), collision is
+\PPOCollisionRate{} (95\% CI \PPOCollisionCI{}), route completion is
+\PPORouteCompletion{}, average speed is \PPOAverageSpeed{}, and successful
+completion time is \PPOCompletionTime{}. The strongest baseline by observed
+success is \StrongestBaseline{}; paired PPO differences are
+\PairedSuccessDifference{} for success and \PairedCollisionDifference{} for
+collision. TBD values mean experiments have not produced the corresponding
+artifact.
+
+\begin{center}
+\IfFileExists{reports/generated/results_table.tex}{
+  \input{reports/generated/results_table.tex}
+}{
+  \IfFileExists{generated/results_table.tex}{
+    \input{generated/results_table.tex}
+  }{\emph{Experiments pending.}}
+}
+\end{center}
+
+\begin{center}
+\IfFileExists{reports/generated/paired_table.tex}{
+  \input{reports/generated/paired_table.tex}
+}{
+  \IfFileExists{generated/paired_table.tex}{
+    \input{generated/paired_table.tex}
+  }{}
+}
+\end{center}
+
+\generatedfigure{training_episode_return.png}{0.9}{Training episode return and rolling mean.}
+\generatedfigure{policy_success_collision.png}{0.9}{Held-out success and collision rates with confidence intervals.}
+\generatedfigure{policy_route_completion.png}{0.8}{Mean route completion by policy.}
+
+\section{Qualitative Driving Examples}
+Six rendering categories cover a safe PPO overtake, a rejected unsafe PPO
+request, a dense-traffic PPO success, a blocked keep-lane episode, a random
+failure, and a genuine PPO failure. A category is omitted when no evaluation
+episode meets its criterion; fallback selection requires explicit approval and
+is recorded in the video manifest.
+
+\section{Failure Analysis}
+Failure analysis should distinguish tactical causes from controller or
+simulation artifacts. Collision type, off-road state, stuck state, timeout,
+front gap, minimum TTC, action counts, traffic density, and weather are retained
+per episode. No successful episodes are cherry-picked for quantitative claims.
+
+\section{Limitations}
+The observation uses privileged CARLA state rather than perception. Neighbor
+classification is approximate near road transitions, the low-level controller
+is compact, Traffic Manager does not represent all driving behavior, and one
+primary PPO seed limits training-variance claims. Closed-loop CARLA evaluation
+does not imply real-world validity or a safety guarantee.
+
+\section{Conclusion}
+This repository provides a reproducible comparison of one state-based PPO
+tactical policy with exactly three non-learning policies under a shared
+conventional low-level controller. Conclusions will be stated only after the
+paired evaluation artifacts are generated.
+
+\end{document}

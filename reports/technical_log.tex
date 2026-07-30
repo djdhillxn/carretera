@@ -1,0 +1,121 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.8in]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\title{CARLA Highway RL: Technical and Iteration Log}
+\author{Living implementation record}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% APPEND-ONLY EXPERIMENT RECORD:
+% Preserve prior run entries, failures, configuration changes, and resolutions.
+% Correct an old entry with a new dated note rather than deleting history.
+
+\section{Runtime and CARLA Installation Notes}
+The implementation targets Python 3.12 and the packaged CARLA 0.9.16 UE4.26
+release. The CARLA Python client and simulator server are separate processes.
+External mode is the default; managed mode requires an explicit CARLA root and
+records the repository-owned process group before it can be stopped. The
+implementation task did not install or run a CARLA server.
+
+\section{Repository Architecture}
+The exact three Python source files are \texttt{carla\_env.py},
+\texttt{policies.py}, and \texttt{run.py}. Environment, controller, sensors,
+traffic, and geometry remain cohesive in the first file; four tactical policy
+adapters remain in the second; orchestration, statistics, plotting, video, sync,
+and report generation remain in the third. Configuration is centralized in
+\texttt{config.yaml}.
+
+\section{Environment Lifecycle}
+The environment connects, validates exact client/server versions, loads Town04
+when required, saves original world settings, applies synchronous fixed-step
+settings, and makes itself the only ticking client. Reset destroys prior
+sensors before vehicles, increments an episode token to invalidate callbacks,
+reseeds every random source, and rebuilds all actor references. Close is
+idempotent and restores owned world settings.
+
+\section{Highway Spawn Discovery}
+Each map spawn is projected to a driving waypoint. Junctions, single-lane
+locations, opposite-direction adjacency, and insufficient non-junction forward
+continuity are rejected. Remaining candidates are deterministically scored by
+adjacent-lane count, continuity, nearby spawn availability, and spawn index.
+Doctor writes the ordered candidate records for inspection.
+
+\section{Neighbor Classification}
+Nearby vehicles are first matched by road and lane identity. A geometric
+fallback uses longitudinal and lateral projection in the candidate lane frame
+with a same-direction tangent check, covering road or section transitions.
+Positive longitudinal projection denotes a front vehicle; deterministic actor
+ordering resolves ties.
+
+\section{Lane-Change Controller}
+The tactical validator checks adjacent driving-lane legality, active
+lane-change state, front and rear gaps, and rear TTC. Accepted changes retain a
+target road/lane key and require lane identity plus small center offset for
+several consecutive ticks before one completion is counted. Repeated tactical
+requests cannot increment completion counts.
+
+\section{Reward Iterations}
+The implementation uses only progress, capped speed, rejected-request cost,
+accepted-change cost, and terminal collision/off-road/stuck penalties. No
+reward iteration or tuning experiment has been performed.
+
+\section{PPO Runs}
+No PPO runs were performed during repository implementation. Fresh and
+additional-budget resume paths share Stable-Baselines3 PPO parameters from the
+resolved configuration; resume retains timestep numbering.
+
+\section{Baseline Runs}
+No server-backed baseline episodes were performed during repository
+implementation. Offline synthetic checks cover action validity and the blocked
+lane branch of the rule-based policy.
+
+\section{Bugs and Resolutions}
+No experimental bugs are recorded. Implementation-time validation findings
+should be appended here with a date once offline and CARLA-backed checks run.
+
+\section{Evaluation Manifest Versions}
+No manifest has been frozen yet. Each future manifest record must include its
+SHA-256 hash, scenario count, seed set, and deliberate replacement reason, if
+any.
+
+\section{Video Rendering Notes}
+The RGB callback uses a bounded queue and exact simulator-frame matching.
+CARLA's BGRA buffer is converted to RGB for environment output and then to BGR
+for OpenCV encoding. Rendering requires
+\texttt{world.no\_rendering\_mode=false}.
+
+\section{Reproducibility Checklist}
+\begin{itemize}
+  \item Resolved configuration and hash saved for training and evaluation.
+  \item Python, NumPy, Traffic Manager, environment, and SB3 seeds fixed.
+  \item Synchronous mode and 0.05\,s fixed delta applied.
+  \item Evaluation conditions paired across all four policies.
+  \item Client/server version mismatch fails before an episode.
+  \item Generated results remain absent or TBD until experiments run.
+\end{itemize}
+
+\section{Optional Future Work}
+The only documented optional extension is a separately labeled CARLA
+BehaviorAgent comparison after the core four-policy experiment is complete.
+
+\section{Experiment Ledger}
+Append one row per material run or decision. Do not rewrite historical rows.
+
+\begin{longtable}{p{1.2cm}p{1.6cm}p{1.2cm}p{0.7cm}p{1.1cm}p{1.4cm}p{1.3cm}p{1.6cm}p{1.5cm}}
+\toprule
+Date & Run name & Git hash & Seed & Timesteps & Config hash & Result & Issue & Decision \\
+\midrule
+\endhead
+Implementation & repository build & pending & 0 & --- & generated at run time &
+Source complete & CARLA unavailable in build environment &
+Run offline checks, then doctor and smoke before training \\
+\bottomrule
+\end{longtable}
+
+\end{document}
