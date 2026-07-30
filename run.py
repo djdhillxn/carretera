@@ -73,6 +73,7 @@ ENVIRONMENT_OVERRIDES = {
     "HIGHWAY_RL_DRIVE_ROOT": ("paths", "drive_root", str),
 }
 NETWORK_ACQUISITION_CALLS = 0
+PREPARE_STATE = {"stage": "platform_validation"}
 
 
 def utc_now():
@@ -412,6 +413,38 @@ def gpu_status():
     return status
 
 
+def graphics_environment():
+    import glob
+    env = os.environ.copy()
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = 0
+    runtime_dir = Path("/tmp/runtime-%s" % uid)
+    try:
+        runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(runtime_dir, 0o700)
+    except OSError:
+        pass
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    icd_dir = Path("/usr/share/vulkan/icd.d")
+    nvidia_icds = []
+    if icd_dir.is_dir():
+        nvidia_icds = glob.glob(str(icd_dir / "*nvidia*.json"))
+    diagnostics = {
+        "uid": uid,
+        "runtime_dir": str(runtime_dir),
+        "nvidia_icds": nvidia_icds,
+        "vk_icd_filenames_set": False,
+        "vk_icd_filenames_value": "",
+    }
+    if len(nvidia_icds) == 1:
+        env["VK_ICD_FILENAMES"] = nvidia_icds[0]
+        diagnostics["vk_icd_filenames_set"] = True
+        diagnostics["vk_icd_filenames_value"] = nvidia_icds[0]
+    return env, diagnostics
+
+
 def vulkan_status():
     executable = shutil.which("vulkaninfo")
     status = {
@@ -427,12 +460,14 @@ def vulkan_status():
     if not executable:
         return status
     try:
+        run_env, diagnostics = graphics_environment()
         result = subprocess.run(
             [executable, "--summary"],
             check=False,
             capture_output=True,
             text=True,
             timeout=30,
+            env=run_env,
         )
         status["exit_code"] = result.returncode
         combined = result.stdout + "\n" + result.stderr
@@ -601,6 +636,11 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False):
         raise RuntimeError(
             "Archive is missing the packaged Linux CarlaUE4 support binary."
         )
+    carla_sh = root_prefix + "CarlaUE4.sh"
+    if not any(name.rstrip("/") == carla_sh for name in normalized_names):
+        raise RuntimeError("Archive is missing CarlaUE4.sh.")
+    if not any("pythonapi/carla/dist" in name.lower() for name in normalized_names):
+        raise RuntimeError("Archive is missing PythonAPI/carla/dist directory.")
     wheels = [
         name
         for name in normalized_names
@@ -612,8 +652,8 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False):
     ]
     if not wheels:
         raise RuntimeError("Archive contains no CARLA %s Linux wheel." % version)
-    if not any("town04" in name.lower() for name in normalized_names):
-        raise RuntimeError("Archive contains no inspectable Town04 package content.")
+    if not any(name.lower().endswith(".pak") and "carlaue4/content/paks/" in name.lower() for name in normalized_names):
+        raise RuntimeError("Archive is missing required pak contents under CarlaUE4/Content/Paks.")
     return {
         "valid": True,
         "archive": str(path),
@@ -1124,6 +1164,7 @@ def acquire_carla_archive(config, args):
     )
 
     def validate_candidate(path):
+        PREPARE_STATE["stage"] = "archive_validation"
         try:
             result = validate_carla_archive(path, version)
             write_json(validation_path, result)
@@ -1166,6 +1207,7 @@ def acquire_carla_archive(config, args):
             if temporary.exists():
                 temporary.unlink()
             print("Restoring CARLA archive from Drive:", drive_archive)
+            PREPARE_STATE["stage"] = "archive_acquisition"
             copy_file_with_progress(drive_archive, temporary)
             if file_sha256(temporary) != metadata["sha256"]:
                 temporary.unlink(missing_ok=True)
@@ -1195,6 +1237,7 @@ def acquire_carla_archive(config, args):
         if args.force_download and part.exists():
             part.unlink()
             print("Removed an old partial file for a clean forced download:", part)
+        PREPARE_STATE["stage"] = "archive_acquisition"
         resolved_url = download_archive(package["download_url"], part)
         validation = validate_candidate(part)
         part.replace(local_archive)
@@ -1301,6 +1344,7 @@ def extract_carla_package(config, archive, validation, force=False):
     final_root = Path(package["local_root"])
     staging_root = Path(package["extraction_staging_root"])
     if runtime_manifest_matches(config, validation["sha256"]) and not force:
+        PREPARE_STATE["stage"] = "wheel_selection"
         wheel = select_carla_wheel(discover_wheels(final_root))
         print("Existing CARLA extraction matches archive; skipping extraction.")
         return wheel, read_json_if_valid(package_manifest_path(config))
@@ -1310,8 +1354,10 @@ def extract_carla_package(config, archive, validation, force=False):
         remove_managed_path(config, staging_root)
     staging_root.mkdir(parents=True)
     try:
+        PREPARE_STATE["stage"] = "archive_extraction"
         safe_extract_archive(archive, staging_root)
         extracted_root = discover_carla_root(staging_root)
+        PREPARE_STATE["stage"] = "wheel_selection"
         wheel = select_carla_wheel(discover_wheels(extracted_root))
         executable = extracted_root / "CarlaUE4.sh"
         support_binary = (
@@ -1377,102 +1423,156 @@ def provisioning_plan(config, args):
 
 
 def command_runtime_prepare(args):
+    global PREPARE_STATE
+    PREPARE_STATE = {"stage": "platform_validation"}
     config = load_config(args.config)
     artifact_root = ensure_artifact_layout(config)
-    plan = provisioning_plan(config, args)
-    write_json(artifact_root / "logs/runtime/runtime_prepare_plan.json", plan)
-    if args.dry_run:
-        status = build_runtime_status(config)
-        save_runtime_status(config, status)
-        print(json.dumps({"plan": plan, "status": status}, indent=2))
-        print("Dry run only: no network, extraction, installation, or deletion occurred.")
-        return
-    print(
-        json.dumps(
-            {
-                "local_archive": plan["local_archive"],
-                "extraction_staging_root": plan["staging_root"],
-                "final_root": plan["final_root"],
-                "minimum_free_disk_gb": config["carla"]["package"][
-                    "minimum_free_disk_gb"
-                ],
-            },
-            indent=2,
+    
+    gpu = None
+    vulkan = None
+    
+    try:
+        PREPARE_STATE["stage"] = "platform_validation"
+        compatibility = validate_provisioning_platform(config)
+        
+        PREPARE_STATE["stage"] = "graphics_diagnostics"
+        gpu = gpu_status()
+        vulkan = vulkan_status()
+        error = gpu_vulkan_error(gpu, vulkan)
+        if error:
+            print("================================================================================")
+            print("WARNING: GPU/Vulkan status check failed/unavailable: %s" % error)
+            print("Package provisioning will continue, but managed server startup remains protected")
+            print("by a strict GPU/Vulkan check.")
+            print("================================================================================")
+            
+        PREPARE_STATE["stage"] = "archive_acquisition"
+        plan = provisioning_plan(config, args)
+        write_json(artifact_root / "logs/runtime/runtime_prepare_plan.json", plan)
+        if args.dry_run:
+            status = build_runtime_status(config)
+            save_runtime_status(config, status)
+            print(json.dumps({"plan": plan, "status": status}, indent=2))
+            print("Dry run only: no network, extraction, installation, or deletion occurred.")
+            return
+            
+        print(
+            json.dumps(
+                {
+                    "local_archive": plan["local_archive"],
+                    "extraction_staging_root": plan["staging_root"],
+                    "final_root": plan["final_root"],
+                    "minimum_free_disk_gb": config["carla"]["package"][
+                        "minimum_free_disk_gb"
+                    ],
+                },
+                indent=2,
+            )
         )
-    )
-    compatibility = validate_provisioning_platform(config)
-    gpu = gpu_status()
-    vulkan = vulkan_status()
-    error = gpu_vulkan_error(gpu, vulkan)
-    if (
-        config["carla"]["server"]["mode"] == "managed"
-        and error
-        and not args.skip_gpu_vulkan_check
-    ):
-        raise RuntimeError(
-            "%s Use --skip-gpu-vulkan-check only for deliberate non-Colab "
-            "package preparation; managed server start remains protected." % error
-        )
-    package = config["carla"]["package"]
-    local_root = Path(package["local_root"])
-    existing_valid = runtime_manifest_matches(config)
-    source = "existing_extraction"
-    drive_validated = False
-    validation = None
-    if existing_valid and not args.force_download and not args.force_extract:
-        manifest = read_json_if_valid(package_manifest_path(config))
-        validation = {
-            "sha256": manifest["archive_sha256"],
-            "byte_size": manifest["archive_size"],
+        
+        package = config["carla"]["package"]
+        local_root = Path(package["local_root"])
+        existing_valid = runtime_manifest_matches(config)
+        source = "existing_extraction"
+        drive_validated = False
+        validation = None
+        
+        if existing_valid and not args.force_download and not args.force_extract:
+            manifest = read_json_if_valid(package_manifest_path(config))
+            validation = {
+                "sha256": manifest["archive_sha256"],
+                "byte_size": manifest["archive_size"],
+            }
+            PREPARE_STATE["stage"] = "wheel_selection"
+            wheel = select_carla_wheel(discover_wheels(local_root))
+            print("Using existing validated CARLA extraction:", local_root)
+        else:
+            validation, source, drive_validated = acquire_carla_archive(config, args)
+            wheel, manifest = extract_carla_package(
+                config,
+                package["local_archive"],
+                validation,
+                force=args.force_extract or args.force_download,
+            )
+            
+        PREPARE_STATE["stage"] = "wheel_installation"
+        install_report = install_packaged_carla_wheel(config, wheel)
+        
+        PREPARE_STATE["stage"] = "final_verification"
+        prepared = {
+            "timestamp": utc_now(),
+            "success": True,
+            "compatibility": compatibility,
+            "gpu": gpu,
+            "vulkan": vulkan,
+            "archive_source": source,
+            "archive_sha256": validation["sha256"],
+            "archive_size": validation["byte_size"],
+            "drive_cache_validated": drive_validated,
+            "package_root": str(local_root),
+            "wheel": str(wheel),
+            "client_install": install_report,
+            "next_command": plan["next_command"],
         }
-        wheel = select_carla_wheel(discover_wheels(local_root))
-        print("Using existing validated CARLA extraction:", local_root)
-    else:
-        validation, source, drive_validated = acquire_carla_archive(config, args)
-        wheel, manifest = extract_carla_package(
-            config,
-            package["local_archive"],
-            validation,
-            force=args.force_extract or args.force_download,
-        )
-    install_report = install_packaged_carla_wheel(config, wheel)
-    prepared = {
-        "timestamp": utc_now(),
-        "success": True,
-        "compatibility": compatibility,
-        "gpu": gpu,
-        "vulkan": vulkan,
-        "archive_source": source,
-        "archive_sha256": validation["sha256"],
-        "archive_size": validation["byte_size"],
-        "drive_cache_validated": drive_validated,
-        "package_root": str(local_root),
-        "wheel": str(wheel),
-        "client_install": install_report,
-        "next_command": plan["next_command"],
-    }
-    write_json(
-        artifact_root / "logs/runtime/runtime_prepare_manifest.json", prepared
-    )
-    local_archive = Path(package["local_archive"])
-    metadata = read_json_if_valid(package["drive_metadata"])
-    drive_cache_now_valid, _ = validate_drive_metadata(
-        metadata, package["drive_archive"], config["carla"]["version"]
-    )
-    if (
-        local_archive.exists()
-        and drive_cache_now_valid
-        and package["delete_local_archive_after_extract"]
-        and not args.keep_local_archive
-    ):
-        remove_managed_path(config, local_archive)
-        prepared["local_archive_deleted_after_extract"] = True
         write_json(
             artifact_root / "logs/runtime/runtime_prepare_manifest.json", prepared
         )
-    print(json.dumps(prepared, indent=2))
-    print("CARLA is prepared but not started.")
-    print("Next command:", plan["next_command"])
+        local_archive = Path(package["local_archive"])
+        metadata = read_json_if_valid(package["drive_metadata"])
+        drive_cache_now_valid, _ = validate_drive_metadata(
+            metadata, package["drive_archive"], config["carla"]["version"]
+        )
+        if (
+            local_archive.exists()
+            and drive_cache_now_valid
+            and package["delete_local_archive_after_extract"]
+            and not args.keep_local_archive
+        ):
+            remove_managed_path(config, local_archive)
+            prepared["local_archive_deleted_after_extract"] = True
+            write_json(
+                artifact_root / "logs/runtime/runtime_prepare_manifest.json", prepared
+            )
+        print(json.dumps(prepared, indent=2))
+        print("CARLA is prepared but not started.")
+        print("Next command:", plan["next_command"])
+        
+    except Exception as exc:
+        import traceback
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)
+        tb_str = traceback.format_exc()
+        
+        gpu_rep = gpu_status()
+        vulk_rep = vulkan_status()
+        
+        try:
+            package = config["carla"]["package"]
+            resolved_paths = {
+                "local_root": str(Path(package["local_root"]).resolve()) if package.get("local_root") else "",
+                "local_archive": str(Path(package["local_archive"]).resolve()) if package.get("local_archive") else "",
+                "extraction_staging_root": str(Path(package["extraction_staging_root"]).resolve()) if package.get("extraction_staging_root") else "",
+                "local_cache_root": str(Path(package["local_cache_root"]).resolve()) if package.get("local_cache_root") else "",
+            }
+        except Exception:
+            resolved_paths = {}
+            
+        failure_record = {
+            "stage": PREPARE_STATE["stage"],
+            "timestamp": utc_now(),
+            "exception_type": exc_type,
+            "exception_message": exc_msg,
+            "traceback": tb_str,
+            "resolved_paths": resolved_paths,
+            "GPU report": gpu_rep,
+            "Vulkan report": vulk_rep,
+        }
+        
+        failure_dir = artifact_root / "logs/runtime"
+        failure_dir.mkdir(parents=True, exist_ok=True)
+        write_json(failure_dir / "runtime_prepare_failure.json", failure_record)
+        print("Provisioning failed at stage '%s'. Failure record written." % PREPARE_STATE["stage"])
+        raise exc
 
 
 def command_runtime_clean_local(args):
@@ -1652,7 +1752,7 @@ def command_server_start(args):
     gpu = gpu_status()
     vulkan = vulkan_status()
     compatibility_error = gpu_vulkan_error(gpu, vulkan)
-    if compatibility_error and not args.skip_gpu_vulkan_check:
+    if compatibility_error:
         raise RuntimeError(compatibility_error)
     previous = read_server_record(config)
     previous_state = server_record_state(config, previous)
@@ -1687,7 +1787,7 @@ def command_server_start(args):
     package = config["carla"]["package"]
     cache_root = Path(package["local_cache_root"])
     cache_root.mkdir(parents=True, exist_ok=True)
-    process_environment = os.environ.copy()
+    process_environment, diagnostics = graphics_environment()
     process_environment["CARLA_CACHE_DIR"] = str(cache_root)
     process = subprocess.Popen(
         command,
@@ -1925,6 +2025,8 @@ def command_doctor(args):
                 "highway_candidate_count": len(env.highway_candidates),
             }
         )
+        if not report["map_available"]:
+            raise RuntimeError("Required map %s is not available on CARLA server." % config["carla"]["map"])
         candidate_path = env.write_highway_candidates(
             artifact_root / "logs/runtime/highway_candidates.json"
         )
@@ -2019,7 +2121,12 @@ def sync_path_excluded(relative):
     relative = Path(relative)
     lowered = [part.lower() for part in relative.parts]
     normalized = relative.as_posix().lower()
-    if normalized == "logs/runtime/carla_server.json":
+    if normalized in (
+        "logs/runtime/carla_server.json",
+        "logs/runtime/runtime_status.json",
+        "logs/runtime/runtime_prepare_plan.json",
+        "logs/runtime/runtime_prepare_failure.json",
+    ):
         return True
     if any(
         part.startswith("carla_0.9.16")
@@ -3559,10 +3666,8 @@ def command_render_videos(args):
                 item for item in selections if item["category"] == args.category
             ]
             if not selections:
-                raise ValueError(
-                    "Category %s is absent from %s"
-                    % (args.category, video_manifest_path)
-                )
+                print("Category %s is absent from %s (skipped rendering)" % (args.category, video_manifest_path))
+                return
     for selection in selections:
         condition_id = selection["condition_id"]
         if condition_id not in scenario_lookup:
@@ -3834,6 +3939,9 @@ def command_smoke(args):
             render_mode="rgb_array",
         )
         try:
+            available_maps = env.client.get_available_maps()
+            if not any(item.endswith("/" + config["carla"]["map"]) or item == config["carla"]["map"] for item in available_maps):
+                raise RuntimeError("Required map %s is not available on CARLA server." % config["carla"]["map"])
             observation, info = env.reset(seed=manifest["scenarios"][0]["seed"])
             observation, reward, terminated, truncated, info = env.step(0)
             frame = env.render()
@@ -3865,6 +3973,9 @@ def command_smoke(args):
     test_config["environment"]["target_route_distance_m"] = 50.0
     checker_env = HighwayDecisionEnv(test_config, mode="train")
     try:
+        available_maps = checker_env.client.get_available_maps()
+        if not any(item.endswith("/" + test_config["carla"]["map"]) or item == test_config["carla"]["map"] for item in available_maps):
+            raise RuntimeError("Required map %s is not available on CARLA server." % test_config["carla"]["map"])
         gym_check_env(checker_env, skip_render_check=True)
         sb3_check_env(checker_env, warn=True)
     finally:

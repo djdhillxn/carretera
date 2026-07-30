@@ -673,7 +673,7 @@ class HighwayDecisionEnv(gym.Env):
             actor,
             plan["lead_speed_kmh"],
             following,
-            plan["npc_auto_lane_change"],
+            False,
         )
         return 1
 
