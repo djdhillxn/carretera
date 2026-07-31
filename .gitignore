@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+._*
+__MACOSX/
 .ipynb_checkpoints/
 .venv*/
 venv/
@@ -24,5 +26,10 @@ CARLA_0.9.16/
 CARLA_0.9.16.extracting/
 CARLA_0.9.16.tar.gz
 CARLA_0.9.16.tar.gz.*
+*.part
+*.aria2
 carla_cache/
 artifacts/logs/runtime/carla_server.json
+artifacts/logs/runtime/runtime_status.json
+artifacts/logs/runtime/runtime_prepare_plan.json
+artifacts/logs/runtime/runtime_prepare_failure.json

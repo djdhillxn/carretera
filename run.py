@@ -2,6 +2,7 @@
 
 import argparse
 import atexit
+import collections
 import copy
 import csv
 import datetime
@@ -597,74 +598,247 @@ def archive_root_from_names(names):
     return next(iter(roots))
 
 
-def validate_carla_archive(path, version="0.9.16", allow_small=False):
-    path = Path(path)
+def inspect_carla_archive(path, version="0.9.16", allow_small=False):
+    path = Path(path).resolve()
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError("CARLA archive is missing or empty: %s" % path)
     with path.open("rb") as handle:
         header = handle.read(512).lower()
     if b"<html" in header or b"<!doctype html" in header:
         raise RuntimeError("Downloaded file is HTML, not a CARLA archive: %s" % path)
+    byte_size = path.stat().st_size
     minimum_bytes = 100 * 1024 * 1024
-    if not allow_small and path.stat().st_size < minimum_bytes:
+    if not allow_small and byte_size < minimum_bytes:
         raise RuntimeError(
-            "CARLA archive is implausibly small (%s bytes): %s"
-            % (path.stat().st_size, path)
+            "CARLA archive is implausibly small (%s bytes): %s" % (byte_size, path)
         )
     try:
         with tarfile.open(path, "r:gz") as archive:
             members = archive.getmembers()
     except (OSError, tarfile.TarError) as exc:
         raise RuntimeError("CARLA archive is not a readable gzip tar: %s" % exc) from exc
-    unsafe = [member.name for member in members if not archive_member_is_safe(member)]
-    if unsafe:
-        raise RuntimeError(
-            "CARLA archive contains unsafe member paths: %s"
-            % ", ".join(unsafe[:5])
-        )
-    names = [member.name for member in members]
-    normalized_names = [
-        str(PurePosixPath(name.replace("\\", "/"))) for name in names
-    ]
-    archive_root = archive_root_from_names(normalized_names)
+
+    names = [m.name for m in members]
+    normalized_names = [str(PurePosixPath(name.replace("\\", "/"))) for name in names]
+
+    roots = set()
+    for p in normalized_names:
+        ppath = PurePosixPath(p)
+        if ppath.name.lower() == "carlaue4.sh":
+            root = str(ppath.parent)
+            prefix = "" if root == "." else root.rstrip("/") + "/"
+            if any(item.lower().startswith(prefix.lower() + "pythonapi/carla/dist/") for item in normalized_names):
+                roots.add(root)
+    root_candidates = sorted(list(roots))
+    archive_root = root_candidates[0] if len(root_candidates) == 1 else (archive_root_from_names(normalized_names) if normalized_names else ".")
     root_prefix = "" if archive_root == "." else archive_root.rstrip("/") + "/"
-    shipping_binary = (
-        root_prefix
-        + "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
-    )
-    if not any(name.lower().rstrip("/") == shipping_binary.lower() for name in normalized_names):
-        raise RuntimeError(
-            "Archive is missing the packaged Linux CarlaUE4 support binary."
-        )
-    carla_sh = root_prefix + "CarlaUE4.sh"
-    if not any(name.lower().rstrip("/") == carla_sh.lower() for name in normalized_names):
-        raise RuntimeError("Archive is missing CarlaUE4.sh.")
-    if not any("pythonapi/carla/dist" in name.lower() for name in normalized_names):
-        raise RuntimeError("Archive is missing PythonAPI/carla/dist directory.")
-    wheels = [
-        name
-        for name in normalized_names
-        if name.lower().endswith(".whl")
-        and "pythonapi/carla/dist/" in name.lower()
-        and version in name
-        and ("linux" in name.lower())
-        and ("x86_64" in name.lower() or "amd64" in name.lower())
+
+    carla_sh_target = (root_prefix + "CarlaUE4.sh").lower()
+    carla_shipping_target = (root_prefix + "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping").lower()
+
+    carla_sh_present = any(name.lower().rstrip("/") == carla_sh_target for name in normalized_names)
+    carla_shipping_present = any(name.lower().rstrip("/") == carla_shipping_target for name in normalized_names)
+
+    wheel_paths = [
+        name for name in normalized_names
+        if name.lower().endswith(".whl") and "pythonapi/carla/dist/" in name.lower()
     ]
-    if not wheels:
-        raise RuntimeError("Archive contains no CARLA %s Linux wheel." % version)
-    if not any(name.lower().endswith(".pak") and "content/paks/" in name.lower() for name in normalized_names):
-        raise RuntimeError("Archive is missing required pak contents under CarlaUE4/Content/Paks.")
+
+    curr_tag = python_tag()
+    matching_wheels = [
+        name for name in wheel_paths
+        if version in name
+        and "linux" in name.lower()
+        and ("x86_64" in name.lower() or "amd64" in name.lower())
+        and re.search(r"-%s(?:-%s)?-" % (re.escape(curr_tag), re.escape(curr_tag)), name.lower())
+    ]
+
+    paks_members = []
+    paks_member_names = []
+    for m, norm in zip(members, normalized_names):
+        if "content/paks" in norm.lower():
+            paks_members.append(m)
+            paks_member_names.append(norm)
+
+    content_paks_exists = len(paks_members) > 0
+    content_paks_member_count = len(paks_members)
+
+    extension_counts = collections.defaultdict(int)
+    container_file_sizes = {}
+    pak_paths = []
+    utoc_paths = []
+    ucas_paths = []
+
+    for m, norm in zip(paks_members, paks_member_names):
+        ext = Path(norm).suffix.lower()
+        extension_counts[ext or "(no_ext)"] += 1
+        if m.isfile() and m.size > 0:
+            if ext == ".pak":
+                pak_paths.append(norm)
+                container_file_sizes[norm] = m.size
+            elif ext == ".utoc":
+                utoc_paths.append(norm)
+                container_file_sizes[norm] = m.size
+            elif ext == ".ucas":
+                ucas_paths.append(norm)
+                container_file_sizes[norm] = m.size
+
+    utoc_stems = {Path(p).stem.lower(): p for p in utoc_paths}
+    ucas_stems = {Path(p).stem.lower(): p for p in ucas_paths}
+    matching_utoc_ucas_stems = sorted(list(set(utoc_stems.keys()).intersection(set(ucas_stems.keys()))))
+    unmatched_utoc_stems = sorted(list(set(utoc_stems.keys()) - set(ucas_stems.keys())))
+    unmatched_ucas_stems = sorted(list(set(ucas_stems.keys()) - set(utoc_stems.keys())))
+
+    sample_content_paks_paths = paks_member_names[:100]
+    unsafe_paths = [m.name for m in members if not archive_member_is_safe(m)]
+
+    town04_archive_evidence = any("town04" in norm.lower() for norm in normalized_names)
+
     return {
-        "valid": True,
-        "archive": str(path),
-        "byte_size": path.stat().st_size,
-        "sha256": file_sha256(path),
+        "archive_path": str(path),
+        "byte_size": byte_size,
         "member_count": len(names),
         "archive_root": archive_root,
-        "wheels": [Path(name).name for name in wheels],
-        "town04_present": True,
+        "root_candidates": root_candidates,
+        "carla_sh_present": carla_sh_present,
+        "carla_shipping_present": carla_shipping_present,
+        "wheel_paths": wheel_paths,
+        "matching_wheels": matching_wheels,
+        "content_paks_exists": content_paks_exists,
+        "content_paks_member_count": content_paks_member_count,
+        "content_paks_extension_counts": dict(extension_counts),
+        "sample_content_paks_paths": sample_content_paks_paths,
+        "pak_paths": pak_paths,
+        "utoc_paths": utoc_paths,
+        "ucas_paths": ucas_paths,
+        "matching_utoc_ucas_stems": matching_utoc_ucas_stems,
+        "unmatched_utoc_stems": unmatched_utoc_stems,
+        "unmatched_ucas_stems": unmatched_ucas_stems,
+        "container_file_sizes": container_file_sizes,
+        "unsafe_paths": unsafe_paths,
+        "town04_archive_evidence": town04_archive_evidence,
+        "inspection_timestamp": utc_now(),
+    }
+
+
+def validate_carla_archive(path, version="0.9.16", allow_small=False, expected_sha256=None, artifact_root=None):
+    path = Path(path).resolve()
+    inventory = inspect_carla_archive(path, version=version, allow_small=allow_small)
+
+    invariants_failed = []
+    if inventory["unsafe_paths"]:
+        invariants_failed.append("CARLA archive contains unsafe member paths: %s" % ", ".join(inventory["unsafe_paths"][:5]))
+    if len(inventory["root_candidates"]) != 1 and inventory["archive_root"] == ".":
+        invariants_failed.append("Archive does not contain exactly one coherent CARLA root.")
+    if not inventory["carla_sh_present"]:
+        invariants_failed.append("Archive is missing CarlaUE4.sh.")
+    if not inventory["carla_shipping_present"]:
+        invariants_failed.append("Archive is missing CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping.")
+    if not inventory["wheel_paths"]:
+        invariants_failed.append("Archive is missing PythonAPI/carla/dist directory or wheels.")
+    if not inventory["matching_wheels"]:
+        invariants_failed.append("Archive contains no CARLA %s Linux x86_64 wheel matching %s." % (version, python_tag()))
+
+    classic_layout_valid = inventory["content_paks_exists"] and len(inventory["pak_paths"]) >= 1
+    iostore_layout_valid = (
+        inventory["content_paks_exists"]
+        and len(inventory["utoc_paths"]) >= 1
+        and len(inventory["ucas_paths"]) >= 1
+        and len(inventory["matching_utoc_ucas_stems"]) >= 1
+    )
+    if not (classic_layout_valid or iostore_layout_valid):
+        invariants_failed.append(
+            "Archive has no valid asset-container layout under Content/Paks. "
+            "Requires either Classic Pak layout (at least one non-empty .pak file) "
+            "or IoStore layout (at least one matching non-empty .utoc and .ucas pair)."
+        )
+
+    calculated_hash = ""
+    if not invariants_failed:
+        calculated_hash = file_sha256(path)
+        if expected_sha256:
+            if calculated_hash.lower() != expected_sha256.lower():
+                invariants_failed.append(
+                    "Archive SHA-256 checksum mismatch: expected %s, got %s."
+                    % (expected_sha256, calculated_hash)
+                )
+
+    if artifact_root is None:
+        try:
+            artifact_root = REPOSITORY_ROOT / "artifacts"
+        except Exception:
+            artifact_root = Path("artifacts")
+    inv_path = artifact_root / "logs/runtime/carla_archive_inventory.json"
+    val_path = artifact_root / "logs/runtime/carla_archive_validation.json"
+
+    write_json(inv_path, inventory)
+
+    if invariants_failed:
+        validation_result = {
+            "valid": False,
+            "archive": str(path),
+            "byte_size": inventory["byte_size"],
+            "member_count": inventory["member_count"],
+            "archive_root": inventory["archive_root"],
+            "content_paks_member_count": inventory["content_paks_member_count"],
+            "content_paks_extension_counts": inventory["content_paks_extension_counts"],
+            "sample_content_paks_paths": inventory["sample_content_paks_paths"],
+            "invariants_failed": invariants_failed,
+            "inventory_path": str(inv_path),
+            "validated_at": utc_now(),
+        }
+        write_json(val_path, validation_result)
+        raise RuntimeError(
+            "CARLA archive validation failed:\n- %s\n"
+            "Archive size: %s bytes | Root: %s | Total members: %s | Content/Paks members: %s | Extensions: %s\n"
+            "Sample paths: %s\n"
+            "Detailed inventory written to: %s"
+            % (
+                "\n- ".join(invariants_failed),
+                inventory["byte_size"],
+                inventory["archive_root"],
+                inventory["member_count"],
+                inventory["content_paks_member_count"],
+                inventory["content_paks_extension_counts"],
+                inventory["sample_content_paks_paths"][:3],
+                inv_path,
+            )
+        )
+
+    target_path = path
+    if str(path).endswith(".part"):
+        target_path = Path(str(path)[:-5])
+        path.replace(target_path)
+
+    validation_result = {
+        "valid": True,
+        "archive": str(target_path),
+        "byte_size": inventory["byte_size"],
+        "sha256": calculated_hash,
+        "member_count": inventory["member_count"],
+        "archive_root": inventory["archive_root"],
+        "wheels": [Path(name).name for name in inventory["matching_wheels"]],
+        "town04_archive_evidence": inventory["town04_archive_evidence"],
+        "expected_sha256_configured": bool(expected_sha256),
         "validated_at": utc_now(),
     }
+    write_json(val_path, validation_result)
+    return validation_result
+
+
+def command_runtime_inspect_archive(args):
+    config = load_config(args.config)
+    artifact_root = ensure_artifact_layout(config)
+    archive_path = resolve_path(args.archive)
+    inventory = inspect_carla_archive(
+        archive_path,
+        version=config["carla"]["version"],
+        allow_small=args.allow_small,
+    )
+    out_path = Path(args.json_output) if args.json_output else (artifact_root / "logs/runtime/carla_archive_inventory.json")
+    write_json(out_path, inventory)
+    print(json.dumps(inventory, indent=2))
+    print("Archive inspection complete. Detailed inventory written to:", out_path)
 
 
 def discover_carla_root(extraction_root):
@@ -1234,15 +1408,30 @@ def acquire_carla_archive(config, args):
 
     if validation is None:
         part = local_archive.with_name(local_archive.name + ".part")
-        if args.force_download and part.exists():
-            part.unlink()
-            print("Removed an old partial file for a clean forced download:", part)
-        PREPARE_STATE["stage"] = "archive_acquisition"
-        resolved_url = download_archive(package["download_url"], part)
-        validation = validate_candidate(part)
-        part.replace(local_archive)
-        validation["archive"] = str(local_archive)
-        source = "official_download"
+        if args.force_download:
+            if part.exists():
+                part.unlink()
+                print("Removed an old partial file for a clean forced download:", part)
+            aria2_sidecar = part.with_name(part.name + ".aria2")
+            if aria2_sidecar.exists():
+                aria2_sidecar.unlink()
+        elif part.is_file() and part.stat().st_size > 0:
+            print("Found existing partial/completed download file; validating before downloading:", part)
+            try:
+                validation = validate_candidate(part)
+                source = "existing_part_file"
+                print("Existing .part file is valid; using it as local archive.")
+            except RuntimeError as exc:
+                print("Existing .part file is not a complete valid archive. Will re-download:", exc)
+                validation = None
+
+        if validation is None:
+            PREPARE_STATE["stage"] = "archive_acquisition"
+            download_meta = download_archive(package["download_url"], part)
+            validation = validate_candidate(part)
+            source = "official_download"
+            if isinstance(download_meta, dict):
+                resolved_url = download_meta.get("resolved_url", "")
 
     metadata = {
         "carla_version": version,
@@ -1364,11 +1553,43 @@ def extract_carla_package(config, archive, validation, force=False):
             extracted_root
             / "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
         )
+        paks_dir = extracted_root / "CarlaUE4/Content/Paks"
         if not support_binary.is_file():
             raise RuntimeError(
                 "Extracted package is missing CarlaUE4-Linux-Shipping."
             )
-        executable.chmod(executable.stat().st_mode | 0o111)
+        if not executable.is_file():
+            raise RuntimeError("Extracted package is missing CarlaUE4.sh.")
+        if not paks_dir.is_dir():
+            raise RuntimeError("Extracted package is missing CarlaUE4/Content/Paks directory.")
+
+        try:
+            executable.chmod(executable.stat().st_mode | 0o755)
+            support_binary.chmod(support_binary.stat().st_mode | 0o755)
+        except Exception as exc:
+            warnings.warn("Could not set executable permissions: %s" % exc)
+
+        pak_files = [f for f in paks_dir.glob("*.pak") if f.is_file() and f.stat().st_size > 0]
+        utoc_files = [f for f in paks_dir.glob("*.utoc") if f.is_file() and f.stat().st_size > 0]
+        ucas_files = [f for f in paks_dir.glob("*.ucas") if f.is_file() and f.stat().st_size > 0]
+
+        extracted_inventory = {
+            "package_root": str(extracted_root),
+            "executable_sh": str(executable),
+            "executable_shipping": str(support_binary),
+            "sh_executable_mode": oct(executable.stat().st_mode),
+            "shipping_executable_mode": oct(support_binary.stat().st_mode),
+            "wheel_selected": str(wheel),
+            "pak_file_count": len(pak_files),
+            "utoc_file_count": len(utoc_files),
+            "ucas_file_count": len(ucas_files),
+            "container_files": [f.name for f in pak_files + utoc_files + ucas_files],
+            "archive_sha256": validation["sha256"],
+            "extracted_at": utc_now(),
+        }
+        artifact_root = ensure_artifact_layout(config)
+        write_json(artifact_root / "logs/runtime/extracted_package_inventory.json", extracted_inventory)
+
         if extracted_root == staging_root.resolve():
             staging_root.replace(final_root)
         else:
@@ -1388,8 +1609,7 @@ def extract_carla_package(config, archive, validation, force=False):
         }
         write_json(package_manifest_path(config), manifest)
         write_json(
-            ensure_artifact_layout(config)
-            / "logs/runtime/carla_package_manifest.json",
+            artifact_root / "logs/runtime/carla_package_manifest.json",
             manifest,
         )
         return wheel, manifest
@@ -2386,18 +2606,148 @@ def command_offline_self_test(args):
             == file_sha256(hash_path)
             == "0badac3c6df445ad3aea62da1350683923aba37c685978afed96a515d12921a3"
         )
-        traversal_path = temporary / "traversal.tar.gz"
-        with tarfile.open(traversal_path, "w:gz") as archive:
-            member = tarfile.TarInfo("../escape.txt")
-            payload = b"escape"
-            member.size = len(payload)
-            archive.addfile(member, io.BytesIO(payload))
+
+        def make_synthetic_tar(
+            tar_path,
+            root="CARLA_0.9.16",
+            has_sh=True,
+            has_shipping=True,
+            has_wheel=True,
+            has_paks_dir=True,
+            pak_files=None,
+            unsafe_member=None,
+        ):
+            if pak_files is None:
+                pak_files = {"CarlaUE4/Content/Paks/Town04.pak": b"pak_data"}
+            prefix = "" if root == "." else root.rstrip("/") + "/"
+            with tarfile.open(tar_path, "w:gz") as archive:
+                if has_sh:
+                    name = prefix + "CarlaUE4.sh"
+                    info = tarfile.TarInfo(name)
+                    payload = b"#!/bin/bash\necho Carla"
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+                if has_shipping:
+                    name = prefix + "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
+                    info = tarfile.TarInfo(name)
+                    payload = b"elf_binary_data"
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+                if has_wheel:
+                    tag = python_tag()
+                    name = prefix + ("PythonAPI/carla/dist/carla-0.9.16-%s-%s-linux_x86_64.whl" % (tag, tag))
+                    info = tarfile.TarInfo(name)
+                    payload = b"wheel_zip_data"
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+                if has_paks_dir:
+                    for rel_path, data in pak_files.items():
+                        name = prefix + rel_path
+                        info = tarfile.TarInfo(name)
+                        payload = data if isinstance(data, bytes) else data.encode("utf-8")
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+                if unsafe_member:
+                    info = tarfile.TarInfo(unsafe_member)
+                    payload = b"unsafe"
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+
+        # 1. Classic Pak accepted
+        classic_tar = temporary / "classic.tar.gz"
+        make_synthetic_tar(classic_tar)
+        tests["archive_classic_pak_accepted"] = validate_carla_archive(classic_tar, allow_small=True)["valid"]
+
+        # 2. IoStore accepted
+        iostore_tar = temporary / "iostore.tar.gz"
+        make_synthetic_tar(iostore_tar, pak_files={"CarlaUE4/Content/Paks/global.utoc": b"utoc", "CarlaUE4/Content/Paks/global.ucas": b"ucas"})
+        tests["archive_iostore_accepted"] = validate_carla_archive(iostore_tar, allow_small=True)["valid"]
+
+        # 3. Pak + IoStore accepted
+        both_tar = temporary / "both.tar.gz"
+        make_synthetic_tar(both_tar, pak_files={"CarlaUE4/Content/Paks/Town04.pak": b"pak", "CarlaUE4/Content/Paks/global.utoc": b"utoc", "CarlaUE4/Content/Paks/global.ucas": b"ucas"})
+        tests["archive_pak_and_iostore_accepted"] = validate_carla_archive(both_tar, allow_small=True)["valid"]
+
+        # 4. .utoc without .ucas rejected
+        utoc_only_tar = temporary / "utoc_only.tar.gz"
+        make_synthetic_tar(utoc_only_tar, pak_files={"CarlaUE4/Content/Paks/global.utoc": b"utoc"})
         try:
-            validate_carla_archive(traversal_path, allow_small=True)
-            traversal_rejected = False
-        except RuntimeError as exc:
-            traversal_rejected = "unsafe" in str(exc).lower()
-        tests["path_traversal_tar_rejected"] = traversal_rejected
+            validate_carla_archive(utoc_only_tar, allow_small=True)
+            tests["archive_utoc_only_rejected"] = False
+        except RuntimeError:
+            tests["archive_utoc_only_rejected"] = True
+
+        # 5. .ucas without .utoc rejected
+        ucas_only_tar = temporary / "ucas_only.tar.gz"
+        make_synthetic_tar(ucas_only_tar, pak_files={"CarlaUE4/Content/Paks/global.ucas": b"ucas"})
+        try:
+            validate_carla_archive(ucas_only_tar, allow_small=True)
+            tests["archive_ucas_only_rejected"] = False
+        except RuntimeError:
+            tests["archive_ucas_only_rejected"] = True
+
+        # 6. Empty file rejected
+        empty_tar = temporary / "empty.tar.gz"
+        make_synthetic_tar(empty_tar, pak_files={"CarlaUE4/Content/Paks/Town04.pak": b""})
+        try:
+            validate_carla_archive(empty_tar, allow_small=True)
+            tests["archive_empty_container_rejected"] = False
+        except RuntimeError:
+            tests["archive_empty_container_rejected"] = True
+
+        # 7. Missing Paks dir rejected
+        nopaks_tar = temporary / "nopaks.tar.gz"
+        make_synthetic_tar(nopaks_tar, has_paks_dir=False)
+        try:
+            validate_carla_archive(nopaks_tar, allow_small=True)
+            tests["archive_missing_paks_dir_rejected"] = False
+        except RuntimeError:
+            tests["archive_missing_paks_dir_rejected"] = True
+
+        # 8. Missing CarlaUE4.sh rejected
+        nosh_tar = temporary / "nosh.tar.gz"
+        make_synthetic_tar(nosh_tar, has_sh=False)
+        try:
+            validate_carla_archive(nosh_tar, allow_small=True)
+            tests["archive_missing_sh_rejected"] = False
+        except RuntimeError:
+            tests["archive_missing_sh_rejected"] = True
+
+        # 9. Missing CarlaUE4-Linux-Shipping rejected
+        noshipping_tar = temporary / "noshipping.tar.gz"
+        make_synthetic_tar(noshipping_tar, has_shipping=False)
+        try:
+            validate_carla_archive(noshipping_tar, allow_small=True)
+            tests["archive_missing_shipping_rejected"] = False
+        except RuntimeError:
+            tests["archive_missing_shipping_rejected"] = True
+
+        # 10. Missing wheel rejected
+        nowheel_tar = temporary / "nowheel.tar.gz"
+        make_synthetic_tar(nowheel_tar, has_wheel=False)
+        try:
+            validate_carla_archive(nowheel_tar, allow_small=True)
+            tests["archive_missing_wheel_rejected"] = False
+        except RuntimeError:
+            tests["archive_missing_wheel_rejected"] = True
+
+        # 11. Unsafe traversal rejected
+        traversal_tar = temporary / "traversal.tar.gz"
+        make_synthetic_tar(traversal_tar, unsafe_member="../escape.txt")
+        try:
+            validate_carla_archive(traversal_tar, allow_small=True)
+            tests["archive_unsafe_traversal_rejected"] = False
+        except RuntimeError:
+            tests["archive_unsafe_traversal_rejected"] = True
+
+        # 12. Inventory details & zero network calls
+        inv = inspect_carla_archive(both_tar, allow_small=True)
+        tests["archive_inventory_extension_counts_and_samples"] = bool(
+            "content_paks_extension_counts" in inv
+            and "sample_content_paks_paths" in inv
+            and inv["content_paks_extension_counts"].get(".pak") == 1
+        )
+
         flat_names = [
             "CarlaUE4.sh",
             "PythonAPI/carla/dist/carla-0.9.16-cp311-cp311-linux_x86_64.whl",
@@ -2493,6 +2843,31 @@ def command_offline_self_test(args):
         )
     )
     tests["no_network_call"] = NETWORK_ACQUISITION_CALLS == network_calls_before
+
+    # Metric & Controller Unit Tests
+    class MockEnv:
+        lateral_integral = 0.0
+        lateral_previous_error = 0.0
+        speed_integral = 0.0
+        speed_previous_error = 0.0
+        def _pid(self, error, integral_name, previous_name, kp, ki, kd, dt):
+            raw_integral = getattr(self, integral_name) + error * dt
+            clipped_integral = float(np.clip(raw_integral, -50.0, 50.0))
+            derivative = (error - getattr(self, previous_name)) / dt
+            setattr(self, integral_name, clipped_integral)
+            setattr(self, previous_name, error)
+            return kp * error + ki * clipped_integral + kd * derivative
+
+    mock_env = MockEnv()
+    pid_val = mock_env._pid(10.0, "speed_integral", "speed_previous_error", 1.0, 0.1, 0.0, 1.0)
+    for _ in range(20):
+        pid_val = mock_env._pid(10.0, "speed_integral", "speed_previous_error", 1.0, 0.1, 0.0, 1.0)
+    tests["pid_integral_clipping"] = bool(mock_env.speed_integral == 50.0 and math.isclose(pid_val, 15.0))
+
+    scen_a = {"map": "Town04", "traffic_density": "low", "weather": "ClearNoon", "seed": 42}
+    scen_b = {"map": "Town04", "traffic_density": "low", "weather": "ClearNoon", "seed": 42}
+    tests["condition_id_stability"] = generate_condition_id(scen_a) == generate_condition_id(scen_b)
+
     report_paths = generate_report_data(config)
     tests["report_macro_generation"] = all(path.exists() for path in report_paths)
     success = all(tests.values())
@@ -2505,7 +2880,8 @@ def command_offline_self_test(args):
     write_json(artifact_root / "logs/runtime/offline_self_test.json", result)
     print(json.dumps(result, indent=2))
     if not success:
-        raise RuntimeError("One or more offline self-tests failed.")
+        failed_keys = [k for k, v in tests.items() if not v]
+        raise RuntimeError("One or more offline self-tests failed: %s" % ", ".join(failed_keys))
 
 
 def manifest_hash(rows):
@@ -2538,6 +2914,29 @@ def compatible_manifest_spawns(env, candidate):
     return sorted(indices)
 
 
+def generate_condition_id(scenario):
+    traffic_density = str(scenario.get("traffic_density", "low"))
+    weather = str(scenario.get("weather", "ClearNoon"))
+    seed = int(scenario.get("seed", 0))
+    canonical = {
+        "map": str(scenario.get("map", "Town04")),
+        "traffic_density": traffic_density,
+        "weather": weather,
+        "seed": seed,
+        "ego_highway_candidate_index": scenario.get("ego_highway_candidate_index", 0),
+        "lead_distance_m": float(scenario.get("lead_distance_m", 35.0)),
+        "lead_speed_kmh": float(scenario.get("lead_speed_kmh", 40.0)),
+        "npc_spawn_indices": sorted([int(x) for x in scenario.get("npc_spawn_indices", [])]),
+        "npc_blueprints": list(scenario.get("npc_blueprints", [])),
+        "npc_desired_speeds_kmh": [round(float(x), 4) for x in scenario.get("npc_desired_speeds_kmh", [])],
+        "npc_following_distances_m": [round(float(x), 4) for x in scenario.get("npc_following_distances_m", [])],
+    }
+    raw_json = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    short_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()[:8]
+    prefix = "%s_%s_seed%s" % (traffic_density, weather.lower(), seed)
+    return "%s_%s" % (prefix, short_hash)
+
+
 def command_make_eval_manifest(args):
     config = load_config(args.config)
     artifact_root = ensure_artifact_layout(config)
@@ -2559,13 +2958,7 @@ def command_make_eval_manifest(args):
             project_to_road=True,
         )
         spawn_indices = compatible_manifest_spawns(env, candidate)
-        blueprints = sorted(
-            [
-                item.id
-                for item in env.world.get_blueprint_library().filter("vehicle.*")
-                if int(item.get_attribute("number_of_wheels")) == 4
-            ]
-        )
+        blueprints = [b.id for b in get_safe_vehicle_blueprints(env.world.get_blueprint_library())]
         seeds = (
             config["evaluation"]["quick_seeds"]
             if args.quick
@@ -2598,45 +2991,45 @@ def command_make_eval_manifest(args):
                         *config["traffic"]["npc_following_distance_range_m"],
                         size=len(selected_spawns),
                     ).round(4).tolist()
-                    rows.append(
-                        {
-                            "condition_id": "condition_%03d" % condition_index,
-                            "seed": int(seed),
-                            "weather": weather,
-                            "traffic_density": density,
-                            "ego_highway_candidate_index": candidate["candidate_index"],
-                            "requested_npc_count": requested,
-                            "lead_distance_m": round(
-                                float(
-                                    rng.uniform(
-                                        *config["traffic"]["lead_distance_range_m"]
-                                    )
-                                ),
-                                4,
+                    scen = {
+                        "map": config["carla"]["map"],
+                        "seed": int(seed),
+                        "weather": weather,
+                        "traffic_density": density,
+                        "ego_highway_candidate_index": candidate["candidate_index"],
+                        "requested_npc_count": requested,
+                        "lead_distance_m": round(
+                            float(
+                                rng.uniform(
+                                    *config["traffic"]["lead_distance_range_m"]
+                                )
                             ),
-                            "lead_speed_kmh": round(
-                                float(
-                                    rng.uniform(
-                                        *config["traffic"]["lead_speed_range_kmh"]
-                                    )
-                                ),
-                                4,
+                            4,
+                        ),
+                        "lead_speed_kmh": round(
+                            float(
+                                rng.uniform(
+                                    *config["traffic"]["lead_speed_range_kmh"]
+                                )
                             ),
-                            "npc_spawn_indices": selected_spawns,
-                            "npc_blueprints": selected_blueprints,
-                            "npc_desired_speeds_kmh": speeds,
-                            "npc_following_distances_m": distances,
-                            "npc_auto_lane_change": config["traffic"][
-                                "npc_auto_lane_change"
-                            ],
-                            "max_episode_seconds": config["environment"][
-                                "max_episode_seconds"
-                            ],
-                            "target_route_distance_m": config["environment"][
-                                "target_route_distance_m"
-                            ],
-                        }
-                    )
+                            4,
+                        ),
+                        "npc_spawn_indices": selected_spawns,
+                        "npc_blueprints": selected_blueprints,
+                        "npc_desired_speeds_kmh": speeds,
+                        "npc_following_distances_m": distances,
+                        "npc_auto_lane_change": config["traffic"][
+                            "npc_auto_lane_change"
+                        ],
+                        "max_episode_seconds": config["environment"][
+                            "max_episode_seconds"
+                        ],
+                        "target_route_distance_m": config["environment"][
+                            "target_route_distance_m"
+                        ],
+                    }
+                    scen["condition_id"] = generate_condition_id(scen)
+                    rows.append(scen)
                     condition_index += 1
     finally:
         if env is not None:
@@ -2922,21 +3315,34 @@ def command_evaluate(args):
     if "ppo" in policies and not args.model:
         raise ValueError("PPO evaluation requires --model.")
     model_hash_value = file_sha256(args.model) if "ppo" in policies else ""
-    output = artifact_root / "evaluations/episode_results.csv"
+
+    default_name = "episode_results_quick.csv" if (manifest.get("quick") or args.quick) else "episode_results.csv"
+    output = Path(args.output) if args.output else (artifact_root / "evaluations" / default_name)
+
     existing = pd.DataFrame()
     completed = set()
-    if output.exists():
+    m_hash = manifest["manifest_hash"]
+    c_hash = config_hash(config)
+
+    if output.exists() and output.stat().st_size > 0:
         if not args.resume_existing:
             raise FileExistsError(
-                "Evaluation output already exists. Use --resume-existing to skip "
-                "completed policy/condition pairs."
+                "Evaluation output already exists: %s. Use --resume-existing or specify --output."
+                % output
             )
         existing = pd.read_csv(output)
-        if existing.duplicated(["policy", "condition_id"]).any():
-            raise ValueError(
-                "Existing evaluation CSV contains duplicate policy/condition pairs."
-            )
-        completed = set(zip(existing["policy"], existing["condition_id"]))
+        if "manifest_hash" in existing.columns:
+            mismatched = existing[existing["manifest_hash"] != m_hash]
+            if not mismatched.empty:
+                raise RuntimeError(
+                    "Existing output CSV %s contains rows from a different manifest_hash (%s vs %s). "
+                    "Specify --output <new_file> or remove stale CSV."
+                    % (output, mismatched["manifest_hash"].iloc[0], m_hash)
+                )
+        if "policy" in existing.columns and "condition_id" in existing.columns:
+            for _, row in existing.iterrows():
+                row_m_hash = str(row.get("manifest_hash", m_hash))
+                completed.add((row_m_hash, str(row["policy"]), str(row["condition_id"])))
 
     env = None
     try:
@@ -2958,7 +3364,8 @@ def command_evaluate(args):
                 model_path=args.model,
             )
             for scenario in scenarios:
-                key = (policy_name, scenario["condition_id"])
+                condition_id = scenario["condition_id"]
+                key = (m_hash, policy_name, condition_id)
                 if key in completed:
                     print("Skipping completed", key)
                     continue
@@ -2975,12 +3382,28 @@ def command_evaluate(args):
                         action
                     )
                 metrics = flatten_episode_metrics(final_info["episode_metrics"])
+                outcome = "success" if metrics.get("success") else ("collision" if metrics.get("collision") else ("offroad" if metrics.get("offroad") else ("stuck" if metrics.get("stuck") else "timeout")))
                 row = {
+                    "manifest_hash": m_hash,
+                    "config_hash": c_hash,
+                    "condition_id": condition_id,
                     "policy": policy_name,
-                    "condition_id": scenario["condition_id"],
                     "seed": scenario["seed"],
                     "traffic_density": scenario["traffic_density"],
                     "weather": scenario["weather"],
+                    "outcome": outcome,
+                    "duration_seconds": metrics.get("elapsed_seconds", 0.0),
+                    "route_progress_m": metrics.get("traveled_distance_m", 0.0),
+                    "mean_speed_kmh": metrics.get("mean_speed_kmh", 0.0),
+                    "max_speed_kmh": metrics.get("max_speed_kmh", 0.0),
+                    "safety_override_activation_events": metrics.get("safety_override_activation_events", 0),
+                    "safety_override_active_seconds": metrics.get("safety_override_active_seconds", 0.0),
+                    "lane_changes_completed": metrics.get("completed_lane_changes", metrics.get("lane_changes_completed", 0)),
+                    "lane_changes_aborted": metrics.get("aborted_lane_changes", metrics.get("lane_change_aborted_count", 0)),
+                    "collision_count": 1 if metrics.get("collision") else 0,
+                    "offroad_count": 1 if metrics.get("offroad") else 0,
+                    "stuck_count": 1 if metrics.get("stuck") else 0,
+                    "timestamp": utc_now(),
                     **metrics,
                     "runtime_wall_clock_seconds": time.monotonic() - started,
                     "model_path_or_baseline_version": (
@@ -2991,26 +3414,24 @@ def command_evaluate(args):
                     "model_sha256": (
                         model_hash_value if policy_name == "ppo" else ""
                     ),
-                    "resolved_config_hash": config_hash(config),
-                    "manifest_hash": manifest["manifest_hash"],
                     "manifest_path": str(manifest_path),
                 }
                 append_csv_row(output, row)
                 completed.add(key)
                 print(
-                    "%s %s success=%s collision=%s completion=%.3f"
+                    "%s %s outcome=%s route_progress=%.1fm speed=%.1fkmh"
                     % (
                         policy_name,
-                        scenario["condition_id"],
-                        row["success"],
-                        row["collision"],
-                        row["route_completion"],
+                        condition_id,
+                        outcome,
+                        row["route_progress_m"],
+                        row["mean_speed_kmh"],
                     )
                 )
     finally:
         if env is not None:
             env.close()
-    print("Evaluation rows:", output)
+    print("Evaluation rows written to:", output)
 
 
 SUMMARY_METRICS = {

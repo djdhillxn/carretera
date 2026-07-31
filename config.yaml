@@ -33,9 +33,9 @@ carla:
     require_drive_cache: false
 
   server:
-    mode: managed
+    mode: external
     root: /content/CARLA_0.9.16
-    quality_training: Epic
+    quality_training: Low
     quality_rendering: Epic
     startup_timeout_seconds: 180
     training_offscreen: true
@@ -59,7 +59,8 @@ environment:
   lane_change_completion_offset_m: 0.45
   lane_change_completion_ticks: 5
   lane_change_lookahead_m: 25.0
-  offroad_grace_ticks: 3
+  lane_change_max_duration_seconds: 6.0
+  offroad_grace_ticks: 15
   ego_vehicle_filter: vehicle.tesla.model3
   highway_candidate_index: null
   highway_continuity_distance_m: 250.0

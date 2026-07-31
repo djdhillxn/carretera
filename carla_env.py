@@ -84,6 +84,55 @@ def calculate_reward_components(config, delta_distance_m, speed_kmh,
     return components
 
 
+SAFE_PASSENGER_CAR_PATTERNS = [
+    "vehicle.audi.a2",
+    "vehicle.audi.etron",
+    "vehicle.audi.tt",
+    "vehicle.bmw.grandtourer",
+    "vehicle.chevrolet.impala",
+    "vehicle.citroen.c3",
+    "vehicle.dodge.charger_2020",
+    "vehicle.ford.mustang",
+    "vehicle.linear.seater",
+    "vehicle.mercedes.coupe",
+    "vehicle.mini.cooper_s",
+    "vehicle.nissan.micra",
+    "vehicle.nissan.patrol",
+    "vehicle.seat.leon",
+    "vehicle.tesla.model3",
+    "vehicle.toyota.prius",
+    "vehicle.volkswagen.t2_2020",
+]
+
+
+def get_safe_vehicle_blueprints(blueprint_library):
+    if blueprint_library is None:
+        return []
+    all_vehicles = sorted(blueprint_library.filter("vehicle.*"), key=lambda b: b.id)
+    safe = []
+    excluded_keywords = (
+        "carlacola", "cybertruck", "ambulance", "firetruck", "police", "bus",
+        "truck", "van", "isetta", "vespa", "harley", "yamaha", "kawasaki",
+        "crossbike", "gazelle", "bh", "diamondback", "montreal"
+    )
+    for bp in all_vehicles:
+        lowered = bp.id.lower()
+        if bp.has_attribute("number_of_wheels"):
+            try:
+                if int(bp.get_attribute("number_of_wheels")) != 4:
+                    continue
+            except ValueError:
+                pass
+        if any(word in lowered for word in excluded_keywords):
+            continue
+        safe.append(bp)
+    if not safe:
+        for bp in all_vehicles:
+            if any(pattern in bp.id.lower() for pattern in SAFE_PASSENGER_CAR_PATTERNS):
+                safe.append(bp)
+    return safe if safe else all_vehicles
+
+
 class HighwayDecisionEnv(gym.Env):
     """Five-action, 20-observation Town04 highway environment."""
 
@@ -249,15 +298,7 @@ class HighwayDecisionEnv(gym.Env):
         self.world = self.client.get_world()
         expected_map = carla_config["map"]
         current_map = self.world.get_map().name.split("/")[-1]
-        if current_map != expected_map:
-            temporary_settings = self.world.get_settings()
-            temporary_settings.synchronous_mode = bool(
-                carla_config["synchronous_mode"]
-            )
-            temporary_settings.fixed_delta_seconds = carla_config[
-                "fixed_delta_seconds"
-            ]
-            self.world.apply_settings(temporary_settings)
+        if current_map.lower() != expected_map.lower():
             try:
                 self.world = self.client.load_world(expected_map, False)
             except TypeError:
@@ -268,7 +309,12 @@ class HighwayDecisionEnv(gym.Env):
         self.traffic_manager = self.client.get_trafficmanager(
             carla_config["traffic_manager_port"]
         )
+        try:
+            self.original_tm_sync = self.traffic_manager.get_synchronous_mode()
+        except Exception:
+            self.original_tm_sync = False
         self.traffic_manager.set_synchronous_mode(True)
+        self.tm_sync_enabled = True
 
     def _apply_world_settings(self):
         settings = self.world.get_settings()
@@ -506,9 +552,16 @@ class HighwayDecisionEnv(gym.Env):
         self.episode_return = 0.0
         self.lane_changes_accepted = 0
         self.lane_changes_completed = 0
+        self.lane_change_aborted_count = 0
+        self.lane_change_start_tick = 0
+        self.lane_change_elapsed_ticks = 0
+        self.lane_change_side = None
         self.unsafe_lane_changes = 0
         self.emergency_interventions = 0
         self.safety_override_active = False
+        self.safety_override_activation_events = 0
+        self.safety_override_active_ticks = 0
+        self.safety_override_active_seconds = 0.0
         self.action_counts = {name: 0 for name in ACTION_NAMES.values()}
         self.speed_samples = []
         self.minimum_ttc_seconds = math.inf
@@ -649,15 +702,16 @@ class HighwayDecisionEnv(gym.Env):
             return 0
         transform = lead_waypoint.transform
         transform.location.z += 0.2
-        vehicles = sorted(
-            self.world.get_blueprint_library().filter("vehicle.*"),
-            key=lambda item: item.id,
-        )
-        vehicles = [
-            blueprint
-            for blueprint in vehicles
-            if int(blueprint.get_attribute("number_of_wheels")) == 4
-        ]
+        blueprint_library = self.world.get_blueprint_library()
+        vehicles = get_safe_vehicle_blueprints(blueprint_library)
+        blueprint = vehicles[0]
+        if lead_waypoint is None:
+            warnings.warn("Structured lead waypoint was unavailable.", RuntimeWarning)
+            return 0
+        transform = lead_waypoint.transform
+        transform.location.z += 0.2
+        blueprint_library = self.world.get_blueprint_library()
+        vehicles = get_safe_vehicle_blueprints(blueprint_library)
         blueprint = vehicles[0]
         if blueprint.has_attribute("role_name"):
             blueprint.set_attribute("role_name", "autopilot")
@@ -694,21 +748,17 @@ class HighwayDecisionEnv(gym.Env):
             selected = [options[index] for index in order[:remaining]]
 
         blueprint_library = self.world.get_blueprint_library()
-        vehicle_blueprints = sorted(
-            [
-                blueprint
-                for blueprint in blueprint_library.filter("vehicle.*")
-                if int(blueprint.get_attribute("number_of_wheels")) == 4
-                and not blueprint.id.endswith("isetta")
-            ],
-            key=lambda item: item.id,
-        )
+        vehicle_blueprints = get_safe_vehicle_blueprints(blueprint_library)
         commands = []
         metadata = []
         for position, (spawn_index, transform) in enumerate(selected):
             configured_ids = plan.get("npc_blueprints", [])
             if position < len(configured_ids):
-                blueprint = blueprint_library.find(configured_ids[position])
+                bp_id = configured_ids[position]
+                try:
+                    blueprint = blueprint_library.find(bp_id)
+                except (IndexError, RuntimeError):
+                    raise RuntimeError("Blueprint %s in scenario plan is missing in CARLA." % bp_id)
             else:
                 blueprint = vehicle_blueprints[
                     int(self.rng.integers(0, len(vehicle_blueprints)))
@@ -1107,7 +1157,9 @@ class HighwayDecisionEnv(gym.Env):
                 lane_type=carla.LaneType.Driving,
             )
             self.target_waypoint = self._driving_adjacent(current_waypoint, side)
+            self.lane_change_side = side
             self.lane_change_active = True
+            self.lane_change_elapsed_ticks = 0
             self.lane_change_completion_counter = 0
             self.lane_changes_accepted += 1
             self.last_lane_change_accepted = True
@@ -1170,16 +1222,19 @@ class HighwayDecisionEnv(gym.Env):
         return candidate
 
     def _pid(self, error, integral_name, previous_name, kp, ki, kd, dt):
-        integral = getattr(self, integral_name) + error * dt
+        raw_integral = getattr(self, integral_name) + error * dt
+        clipped_integral = float(np.clip(raw_integral, -50.0, 50.0))
         derivative = (error - getattr(self, previous_name)) / dt
-        setattr(self, integral_name, np.clip(integral, -50.0, 50.0))
+        setattr(self, integral_name, clipped_integral)
         setattr(self, previous_name, error)
-        return kp * error + ki * integral + kd * derivative
+        return kp * error + ki * clipped_integral + kd * derivative
 
     def _following_override(self, state, effective_target_kmh):
         following = self.config["controller"]["following"]
-        self.safety_override_active = False
+        is_override = False
         if not following["enabled"]:
+            if getattr(self, "safety_override_active", False):
+                self.safety_override_active = False
             return effective_target_kmh, 0.0, False
 
         lane = state["lanes"]["current"]
@@ -1205,16 +1260,26 @@ class HighwayDecisionEnv(gym.Env):
         )
         proportional_brake = 0.0
         if gap < desired_gap:
-            self.safety_override_active = True
-            self.emergency_interventions += 1
+            is_override = True
             front_speed_kmh = max(0.0, lane["front_speed_mps"] * 3.6)
             effective_target_kmh = min(effective_target_kmh, front_speed_kmh)
             proportional_brake = np.clip(
                 (desired_gap - gap) / max(desired_gap, 0.1), 0.0, 1.0
             )
         if emergency:
-            self.safety_override_active = True
+            is_override = True
             proportional_brake = 1.0
+
+        if is_override:
+            self.safety_override_active_ticks += 1
+            if not getattr(self, "safety_override_active", False):
+                self.safety_override_activation_events += 1
+                self.emergency_interventions += 1
+        self.safety_override_active = is_override
+        self.safety_override_active_seconds = (
+            self.safety_override_active_ticks
+            * self.config["carla"]["fixed_delta_seconds"]
+        )
         return effective_target_kmh, proportional_brake, emergency
 
     def _low_level_control(self, state):
@@ -1275,9 +1340,31 @@ class HighwayDecisionEnv(gym.Env):
         )
         self.ego.apply_control(control)
 
+    def _abort_lane_change(self, reason):
+        self.lane_change_active = False
+        self.target_lane_key = None
+        self.lane_change_side = None
+        self.lane_change_completion_counter = 0
+        self.lane_change_elapsed_ticks = 0
+        self.lane_change_aborted_count += 1
+        if self.ego is not None and self.map is not None:
+            waypoint = self.map.get_waypoint(
+                self.ego.get_location(),
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            if waypoint is not None:
+                self.target_waypoint = waypoint
+
     def _update_lane_change_completion(self):
         if not self.lane_change_active or not self.target_lane_key:
             return
+        self.lane_change_elapsed_ticks += 1
+        max_duration = float(
+            self.config["environment"].get("lane_change_max_duration_seconds", 6.0)
+        )
+        max_ticks = int(round(max_duration / self.config["carla"]["fixed_delta_seconds"]))
+
         waypoint = self.map.get_waypoint(
             self.ego.get_location(),
             project_to_road=True,
@@ -1285,7 +1372,15 @@ class HighwayDecisionEnv(gym.Env):
         )
         if waypoint is None:
             self.lane_change_completion_counter = 0
+            if self.lane_change_elapsed_ticks >= max_ticks:
+                self._abort_lane_change("offroad_or_invalid_waypoint")
             return
+
+        if getattr(self, "lane_change_side", None) is not None:
+            adj = self._driving_adjacent(waypoint, self.lane_change_side)
+            if adj is not None:
+                self.target_lane_key = (adj.road_id, adj.lane_id)
+
         matches = (
             waypoint.road_id == self.target_lane_key[0]
             and waypoint.lane_id == self.target_lane_key[1]
@@ -1299,15 +1394,20 @@ class HighwayDecisionEnv(gym.Env):
             self.lane_change_completion_counter += 1
         else:
             self.lane_change_completion_counter = 0
+
         if (
             self.lane_change_completion_counter
             >= self.config["environment"]["lane_change_completion_ticks"]
         ):
             self.lane_change_active = False
             self.target_lane_key = None
+            self.lane_change_side = None
             self.target_waypoint = waypoint
             self.lane_change_completion_counter = 0
+            self.lane_change_elapsed_ticks = 0
             self.lane_changes_completed += 1
+        elif self.lane_change_elapsed_ticks >= max_ticks:
+            self._abort_lane_change("timeout_exceeded")
 
     def _capture_render_frame(self, simulation_frame):
         if self.mode != "render":
@@ -1607,14 +1707,16 @@ class HighwayDecisionEnv(gym.Env):
             return
         self.episode_token += 1
         self._cleanup_actors()
-        if self.traffic_manager is not None:
+        if self.traffic_manager is not None and getattr(self, "tm_sync_enabled", False):
             try:
-                self.traffic_manager.set_synchronous_mode(False)
-            except RuntimeError as exc:
+                original_sync = getattr(self, "original_tm_sync", False)
+                self.traffic_manager.set_synchronous_mode(bool(original_sync))
+            except Exception as exc:
                 warnings.warn(
                     "Could not restore Traffic Manager mode: %s" % exc,
                     RuntimeWarning,
                 )
+            self.tm_sync_enabled = False
         if (
             self.world is not None
             and self.owns_world_settings
@@ -1622,9 +1724,10 @@ class HighwayDecisionEnv(gym.Env):
         ):
             try:
                 self.world.apply_settings(self.original_world_settings)
-            except RuntimeError as exc:
+            except Exception as exc:
                 warnings.warn(
                     "Could not restore original CARLA world settings: %s" % exc,
                     RuntimeWarning,
                 )
+            self.owns_world_settings = False
         self.closed = True
