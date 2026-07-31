@@ -632,12 +632,12 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False):
         root_prefix
         + "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
     )
-    if not any(name.rstrip("/") == shipping_binary for name in normalized_names):
+    if not any(name.lower().rstrip("/") == shipping_binary.lower() for name in normalized_names):
         raise RuntimeError(
             "Archive is missing the packaged Linux CarlaUE4 support binary."
         )
     carla_sh = root_prefix + "CarlaUE4.sh"
-    if not any(name.rstrip("/") == carla_sh for name in normalized_names):
+    if not any(name.lower().rstrip("/") == carla_sh.lower() for name in normalized_names):
         raise RuntimeError("Archive is missing CarlaUE4.sh.")
     if not any("pythonapi/carla/dist" in name.lower() for name in normalized_names):
         raise RuntimeError("Archive is missing PythonAPI/carla/dist directory.")
@@ -652,7 +652,7 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False):
     ]
     if not wheels:
         raise RuntimeError("Archive contains no CARLA %s Linux wheel." % version)
-    if not any(name.lower().endswith(".pak") and "carlaue4/content/paks/" in name.lower() for name in normalized_names):
+    if not any(name.lower().endswith(".pak") and "content/paks/" in name.lower() for name in normalized_names):
         raise RuntimeError("Archive is missing required pak contents under CarlaUE4/Content/Paks.")
     return {
         "valid": True,
@@ -2014,8 +2014,8 @@ def command_doctor(args):
                 "server_version": env.client.get_server_version(),
                 "map": env.map.name,
                 "map_available": any(
-                    item.endswith("/" + config["carla"]["map"])
-                    or item == config["carla"]["map"]
+                    item.lower().endswith("/" + config["carla"]["map"].lower())
+                    or item.lower() == config["carla"]["map"].lower()
                     for item in env.client.get_available_maps()
                 ),
                 "synchronous_mode": env.world.get_settings().synchronous_mode,
@@ -3940,7 +3940,7 @@ def command_smoke(args):
         )
         try:
             available_maps = env.client.get_available_maps()
-            if not any(item.endswith("/" + config["carla"]["map"]) or item == config["carla"]["map"] for item in available_maps):
+            if not any(item.lower().endswith("/" + config["carla"]["map"].lower()) or item.lower() == config["carla"]["map"].lower() for item in available_maps):
                 raise RuntimeError("Required map %s is not available on CARLA server." % config["carla"]["map"])
             observation, info = env.reset(seed=manifest["scenarios"][0]["seed"])
             observation, reward, terminated, truncated, info = env.step(0)
@@ -3974,7 +3974,7 @@ def command_smoke(args):
     checker_env = HighwayDecisionEnv(test_config, mode="train")
     try:
         available_maps = checker_env.client.get_available_maps()
-        if not any(item.endswith("/" + test_config["carla"]["map"]) or item == test_config["carla"]["map"] for item in available_maps):
+        if not any(item.lower().endswith("/" + test_config["carla"]["map"].lower()) or item.lower() == test_config["carla"]["map"].lower() for item in available_maps):
             raise RuntimeError("Required map %s is not available on CARLA server." % test_config["carla"]["map"])
         gym_check_env(checker_env, skip_render_check=True)
         sb3_check_env(checker_env, warn=True)
