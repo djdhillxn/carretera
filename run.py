@@ -653,10 +653,13 @@ def inspect_carla_archive(path, version="0.9.16", allow_small=False):
         and re.search(r"-%s(?:-%s)?-" % (re.escape(curr_tag), re.escape(curr_tag)), name.lower())
     ]
 
+    # Content/Paks evaluation
+    paks_target_prefix = (root_prefix + "CarlaUE4/Content/Paks/").lower()
     paks_members = []
     paks_member_names = []
     for m, norm in zip(members, normalized_names):
-        if "content/paks" in norm.lower():
+        norm_low = norm.lower()
+        if norm_low.startswith(paks_target_prefix) or norm_low == paks_target_prefix.rstrip("/"):
             paks_members.append(m)
             paks_member_names.append(norm)
 
@@ -688,10 +691,75 @@ def inspect_carla_archive(path, version="0.9.16", allow_small=False):
     matching_utoc_ucas_stems = sorted(list(set(utoc_stems.keys()).intersection(set(ucas_stems.keys()))))
     unmatched_utoc_stems = sorted(list(set(utoc_stems.keys()) - set(ucas_stems.keys())))
     unmatched_ucas_stems = sorted(list(set(ucas_stems.keys()) - set(utoc_stems.keys())))
-
     sample_content_paks_paths = paks_member_names[:100]
-    unsafe_paths = [m.name for m in members if not archive_member_is_safe(m)]
 
+    # CarlaUE4/Content evaluation
+    content_target_prefix = (root_prefix + "CarlaUE4/Content/").lower()
+    asset_registry_target = (root_prefix + "CarlaUE4/AssetRegistry.bin").lower()
+
+    content_root_members = []
+    content_root_member_names = []
+    for m, norm in zip(members, normalized_names):
+        norm_low = norm.lower()
+        if norm_low.startswith(content_target_prefix) or norm_low == content_target_prefix.rstrip("/"):
+            content_root_members.append(m)
+            content_root_member_names.append(norm)
+
+    content_root_exists = len(content_root_members) > 0
+    content_root_member_count = len(content_root_members)
+
+    content_root_extension_counts = collections.defaultdict(int)
+    loose_uasset_paths = []
+    loose_umap_paths = []
+    loose_uexp_paths = []
+    loose_ubulk_paths = []
+    loose_asset_total_bytes = 0
+
+    for m, norm in zip(content_root_members, content_root_member_names):
+        ext = Path(norm).suffix.lower()
+        if m.isfile() and m.size > 0:
+            content_root_extension_counts[ext or "(no_ext)"] += 1
+            if ext == ".uasset":
+                loose_uasset_paths.append(norm)
+                loose_asset_total_bytes += m.size
+            elif ext == ".umap":
+                loose_umap_paths.append(norm)
+                loose_asset_total_bytes += m.size
+            elif ext == ".uexp":
+                loose_uexp_paths.append(norm)
+                loose_asset_total_bytes += m.size
+            elif ext == ".ubulk":
+                loose_ubulk_paths.append(norm)
+                loose_asset_total_bytes += m.size
+        elif m.isdir():
+            content_root_extension_counts["(dir)"] += 1
+
+    sample_content_root_paths = content_root_member_names[:100]
+
+    asset_registry_present = False
+    asset_registry_path = ""
+    asset_registry_size = 0
+    for m, norm in zip(members, normalized_names):
+        if norm.lower() == asset_registry_target and m.isfile() and m.size > 0:
+            asset_registry_present = True
+            asset_registry_path = norm
+            asset_registry_size = m.size
+            break
+
+    loose_primary_asset_count = len(loose_uasset_paths) + len(loose_umap_paths)
+    loose_companion_asset_count = len(loose_uexp_paths) + len(loose_ubulk_paths)
+
+    layout_active = []
+    if content_paks_exists and len(pak_paths) >= 1:
+        layout_active.append("classic_pak")
+    if content_paks_exists and len(utoc_paths) >= 1 and len(ucas_paths) >= 1 and len(matching_utoc_ucas_stems) >= 1:
+        layout_active.append("iostore")
+    if content_root_exists and asset_registry_present and loose_primary_asset_count >= 1:
+        layout_active.append("loose_cooked")
+
+    detected_asset_layout = ", ".join(layout_active) if layout_active else "none"
+
+    unsafe_paths = [m.name for m in members if not archive_member_is_safe(m)]
     town04_archive_evidence = any("town04" in norm.lower() for norm in normalized_names)
 
     return {
@@ -715,6 +783,21 @@ def inspect_carla_archive(path, version="0.9.16", allow_small=False):
         "unmatched_utoc_stems": unmatched_utoc_stems,
         "unmatched_ucas_stems": unmatched_ucas_stems,
         "container_file_sizes": container_file_sizes,
+        "content_root_exists": content_root_exists,
+        "content_root_member_count": content_root_member_count,
+        "content_root_extension_counts": dict(content_root_extension_counts),
+        "sample_content_root_paths": sample_content_root_paths,
+        "asset_registry_present": asset_registry_present,
+        "asset_registry_path": asset_registry_path,
+        "asset_registry_size": asset_registry_size,
+        "loose_uasset_paths": loose_uasset_paths,
+        "loose_umap_paths": loose_umap_paths,
+        "loose_uexp_paths": loose_uexp_paths,
+        "loose_ubulk_paths": loose_ubulk_paths,
+        "loose_primary_asset_count": loose_primary_asset_count,
+        "loose_companion_asset_count": loose_companion_asset_count,
+        "loose_asset_total_bytes": loose_asset_total_bytes,
+        "detected_asset_layout": detected_asset_layout,
         "unsafe_paths": unsafe_paths,
         "town04_archive_evidence": town04_archive_evidence,
         "inspection_timestamp": utc_now(),
@@ -739,18 +822,13 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False, expected_s
     if not inventory["matching_wheels"]:
         invariants_failed.append("Archive contains no CARLA %s Linux x86_64 wheel matching %s." % (version, python_tag()))
 
-    classic_layout_valid = inventory["content_paks_exists"] and len(inventory["pak_paths"]) >= 1
-    iostore_layout_valid = (
-        inventory["content_paks_exists"]
-        and len(inventory["utoc_paths"]) >= 1
-        and len(inventory["ucas_paths"]) >= 1
-        and len(inventory["matching_utoc_ucas_stems"]) >= 1
-    )
-    if not (classic_layout_valid or iostore_layout_valid):
+    if inventory["detected_asset_layout"] == "none":
         invariants_failed.append(
-            "Archive has no valid asset-container layout under Content/Paks. "
-            "Requires either Classic Pak layout (at least one non-empty .pak file) "
-            "or IoStore layout (at least one matching non-empty .utoc and .ucas pair)."
+            "Archive has no recognized CARLA cooked-asset layout.\n"
+            "Expected one of:\n"
+            "1. nonempty Classic Pak files under CarlaUE4/Content/Paks;\n"
+            "2. matching nonempty IoStore .utoc/.ucas files under that directory; or\n"
+            "3. a nonempty CarlaUE4/AssetRegistry.bin plus loose nonempty .uasset or .umap files under CarlaUE4/Content."
         )
 
     calculated_hash = ""
@@ -780,8 +858,13 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False, expected_s
             "byte_size": inventory["byte_size"],
             "member_count": inventory["member_count"],
             "archive_root": inventory["archive_root"],
+            "asset_registry_present": inventory["asset_registry_present"],
+            "asset_registry_size": inventory["asset_registry_size"],
+            "content_root_member_count": inventory["content_root_member_count"],
+            "content_root_extension_counts": inventory["content_root_extension_counts"],
             "content_paks_member_count": inventory["content_paks_member_count"],
             "content_paks_extension_counts": inventory["content_paks_extension_counts"],
+            "sample_content_root_paths": inventory["sample_content_root_paths"],
             "sample_content_paks_paths": inventory["sample_content_paks_paths"],
             "invariants_failed": invariants_failed,
             "inventory_path": str(inv_path),
@@ -790,16 +873,25 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False, expected_s
         write_json(val_path, validation_result)
         raise RuntimeError(
             "CARLA archive validation failed:\n- %s\n"
-            "Archive size: %s bytes | Root: %s | Total members: %s | Content/Paks members: %s | Extensions: %s\n"
-            "Sample paths: %s\n"
+            "Archive size: %s bytes | Root: %s | Total members: %s\n"
+            "AssetRegistry present: %s (size: %s bytes)\n"
+            "Content members: %s | Content extensions: %s\n"
+            "Content/Paks members: %s | Content/Paks extensions: %s\n"
+            "Sample Content paths: %s\n"
+            "Sample Content/Paks paths: %s\n"
             "Detailed inventory written to: %s"
             % (
                 "\n- ".join(invariants_failed),
                 inventory["byte_size"],
                 inventory["archive_root"],
                 inventory["member_count"],
+                inventory["asset_registry_present"],
+                inventory["asset_registry_size"],
+                inventory["content_root_member_count"],
+                inventory["content_root_extension_counts"],
                 inventory["content_paks_member_count"],
                 inventory["content_paks_extension_counts"],
+                inventory["sample_content_root_paths"][:3],
                 inventory["sample_content_paks_paths"][:3],
                 inv_path,
             )
@@ -817,6 +909,7 @@ def validate_carla_archive(path, version="0.9.16", allow_small=False, expected_s
         "sha256": calculated_hash,
         "member_count": inventory["member_count"],
         "archive_root": inventory["archive_root"],
+        "detected_asset_layout": inventory["detected_asset_layout"],
         "wheels": [Path(name).name for name in inventory["matching_wheels"]],
         "town04_archive_evidence": inventory["town04_archive_evidence"],
         "expected_sha256_configured": bool(expected_sha256),
@@ -1528,6 +1621,73 @@ def install_packaged_carla_wheel(config, wheel, dry_run=False):
     return report
 
 
+def inspect_extracted_asset_layout(extracted_root):
+    extracted_root = Path(extracted_root).resolve()
+    carla_content = extracted_root / "CarlaUE4/Content"
+    paks_dir = carla_content / "Paks"
+    asset_registry = extracted_root / "CarlaUE4/AssetRegistry.bin"
+
+    asset_registry_present = asset_registry.is_file() and asset_registry.stat().st_size > 0
+    asset_registry_size = asset_registry.stat().st_size if asset_registry_present else 0
+
+    pak_files = [f for f in paks_dir.glob("*.pak") if f.is_file() and f.stat().st_size > 0] if paks_dir.is_dir() else []
+    utoc_files = [f for f in paks_dir.glob("*.utoc") if f.is_file() and f.stat().st_size > 0] if paks_dir.is_dir() else []
+    ucas_files = [f for f in paks_dir.glob("*.ucas") if f.is_file() and f.stat().st_size > 0] if paks_dir.is_dir() else []
+
+    utoc_stems = {f.stem.lower() for f in utoc_files}
+    ucas_stems = {f.stem.lower() for f in ucas_files}
+    matching_utoc_ucas_count = len(utoc_stems.intersection(ucas_stems))
+
+    uasset_files = []
+    umap_files = []
+    uexp_files = []
+    ubulk_files = []
+
+    if carla_content.is_dir():
+        for path in carla_content.rglob("*"):
+            if path.is_file() and path.stat().st_size > 0:
+                ext = path.suffix.lower()
+                if ext == ".uasset":
+                    uasset_files.append(path)
+                elif ext == ".umap":
+                    umap_files.append(path)
+                elif ext == ".uexp":
+                    uexp_files.append(path)
+                elif ext == ".ubulk":
+                    ubulk_files.append(path)
+
+    layout_active = []
+    if paks_dir.is_dir() and len(pak_files) >= 1:
+        layout_active.append("classic_pak")
+    if paks_dir.is_dir() and len(utoc_files) >= 1 and len(ucas_files) >= 1 and matching_utoc_ucas_count >= 1:
+        layout_active.append("iostore")
+    if carla_content.is_dir() and asset_registry_present and (len(uasset_files) + len(umap_files)) >= 1:
+        layout_active.append("loose_cooked")
+
+    detected_asset_layout = ", ".join(layout_active) if layout_active else "none"
+
+    all_found = pak_files + utoc_files + ucas_files + uasset_files + umap_files
+    sample_files = [str(f.relative_to(extracted_root)) for f in all_found[:50]]
+
+    return {
+        "detected_asset_layout": detected_asset_layout,
+        "asset_registry_present": asset_registry_present,
+        "asset_registry_path": str(asset_registry) if asset_registry_present else "",
+        "asset_registry_size": asset_registry_size,
+        "content_dir": str(carla_content),
+        "content_dir_exists": carla_content.is_dir(),
+        "pak_file_count": len(pak_files),
+        "utoc_file_count": len(utoc_files),
+        "ucas_file_count": len(ucas_files),
+        "matching_utoc_ucas_count": matching_utoc_ucas_count,
+        "uasset_file_count": len(uasset_files),
+        "umap_file_count": len(umap_files),
+        "uexp_file_count": len(uexp_files),
+        "ubulk_file_count": len(ubulk_files),
+        "sample_files": sample_files,
+    }
+
+
 def extract_carla_package(config, archive, validation, force=False):
     package = config["carla"]["package"]
     final_root = Path(package["local_root"])
@@ -1553,25 +1713,28 @@ def extract_carla_package(config, archive, validation, force=False):
             extracted_root
             / "CarlaUE4/Binaries/Linux/CarlaUE4-Linux-Shipping"
         )
-        paks_dir = extracted_root / "CarlaUE4/Content/Paks"
         if not support_binary.is_file():
             raise RuntimeError(
                 "Extracted package is missing CarlaUE4-Linux-Shipping."
             )
         if not executable.is_file():
             raise RuntimeError("Extracted package is missing CarlaUE4.sh.")
-        if not paks_dir.is_dir():
-            raise RuntimeError("Extracted package is missing CarlaUE4/Content/Paks directory.")
+
+        layout_info = inspect_extracted_asset_layout(extracted_root)
+        if layout_info["detected_asset_layout"] == "none":
+            raise RuntimeError(
+                "Extracted package has no recognized CARLA cooked-asset layout.\n"
+                "Expected one of:\n"
+                "1. nonempty Classic Pak files under CarlaUE4/Content/Paks;\n"
+                "2. matching nonempty IoStore .utoc/.ucas files under that directory; or\n"
+                "3. a nonempty CarlaUE4/AssetRegistry.bin plus loose nonempty .uasset or .umap files under CarlaUE4/Content."
+            )
 
         try:
             executable.chmod(executable.stat().st_mode | 0o755)
             support_binary.chmod(support_binary.stat().st_mode | 0o755)
         except Exception as exc:
             warnings.warn("Could not set executable permissions: %s" % exc)
-
-        pak_files = [f for f in paks_dir.glob("*.pak") if f.is_file() and f.stat().st_size > 0]
-        utoc_files = [f for f in paks_dir.glob("*.utoc") if f.is_file() and f.stat().st_size > 0]
-        ucas_files = [f for f in paks_dir.glob("*.ucas") if f.is_file() and f.stat().st_size > 0]
 
         extracted_inventory = {
             "package_root": str(extracted_root),
@@ -1580,10 +1743,8 @@ def extract_carla_package(config, archive, validation, force=False):
             "sh_executable_mode": oct(executable.stat().st_mode),
             "shipping_executable_mode": oct(support_binary.stat().st_mode),
             "wheel_selected": str(wheel),
-            "pak_file_count": len(pak_files),
-            "utoc_file_count": len(utoc_files),
-            "ucas_file_count": len(ucas_files),
-            "container_files": [f.name for f in pak_files + utoc_files + ucas_files],
+            "detected_asset_layout": layout_info["detected_asset_layout"],
+            "asset_layout_info": layout_info,
             "archive_sha256": validation["sha256"],
             "extracted_at": utc_now(),
         }
@@ -2640,7 +2801,7 @@ def command_offline_self_test(args):
                     payload = b"wheel_zip_data"
                     info.size = len(payload)
                     archive.addfile(info, io.BytesIO(payload))
-                if has_paks_dir:
+                if pak_files:
                     for rel_path, data in pak_files.items():
                         name = prefix + rel_path
                         info = tarfile.TarInfo(name)
@@ -2695,14 +2856,44 @@ def command_offline_self_test(args):
         except RuntimeError:
             tests["archive_empty_container_rejected"] = True
 
-        # 7. Missing Paks dir rejected
-        nopaks_tar = temporary / "nopaks.tar.gz"
-        make_synthetic_tar(nopaks_tar, has_paks_dir=False)
+        # 7. Loose cooked archive accepted
+        loose_tar = temporary / "loose_cooked.tar.gz"
+        make_synthetic_tar(
+            loose_tar,
+            has_paks_dir=False,
+            pak_files={
+                "CarlaUE4/AssetRegistry.bin": b"registry_bytes",
+                "CarlaUE4/Content/Carla/Maps/Town04/Town04.umap": b"umap_bytes",
+                "CarlaUE4/Content/Carla/Maps/Town04/Town04_BuiltData.uasset": b"uasset_bytes",
+                "CarlaUE4/Content/Carla/Maps/Town04/Town04_BuiltData.uexp": b"uexp_bytes",
+            },
+        )
+        val_loose = validate_carla_archive(loose_tar, allow_small=True)
+        tests["archive_loose_cooked_accepted"] = (
+            val_loose["valid"] and "loose_cooked" in val_loose["detected_asset_layout"]
+        )
+
+        # 8. No cooked assets rejected with recognized-layout error
+        nocooked_tar = temporary / "no_cooked.tar.gz"
+        make_synthetic_tar(nocooked_tar, has_paks_dir=False, pak_files={})
         try:
-            validate_carla_archive(nopaks_tar, allow_small=True)
-            tests["archive_missing_paks_dir_rejected"] = False
-        except RuntimeError:
-            tests["archive_missing_paks_dir_rejected"] = True
+            validate_carla_archive(nocooked_tar, allow_small=True)
+            tests["archive_no_cooked_assets_rejected"] = False
+        except RuntimeError as exc:
+            tests["archive_no_cooked_assets_rejected"] = (
+                "Archive has no recognized CARLA cooked-asset layout" in str(exc)
+            )
+
+        # Extracted filesystem check for loose cooked tree
+        extracted_loose_dir = temporary / "extracted_loose"
+        (extracted_loose_dir / "CarlaUE4/Content/Carla/Maps/Town04").mkdir(parents=True, exist_ok=True)
+        (extracted_loose_dir / "CarlaUE4/AssetRegistry.bin").write_bytes(b"registry")
+        (extracted_loose_dir / "CarlaUE4/Content/Carla/Maps/Town04/Town04.umap").write_bytes(b"umap")
+        (extracted_loose_dir / "CarlaUE4/Content/Carla/Maps/Town04/Town04.uasset").write_bytes(b"uasset")
+        extracted_layout = inspect_extracted_asset_layout(extracted_loose_dir)
+        tests["extracted_loose_cooked_accepted"] = (
+            "loose_cooked" in extracted_layout["detected_asset_layout"]
+        )
 
         # 8. Missing CarlaUE4.sh rejected
         nosh_tar = temporary / "nosh.tar.gz"
